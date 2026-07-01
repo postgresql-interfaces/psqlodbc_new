@@ -1,0 +1,6 @@
+option('driver_manager',
+    type : 'combo',
+    choices : ['auto', 'unixodbc', 'iodbc', 'none'],
+    value : 'auto',
+    description : 'Which ODBC Driver Manager to link against',
+)

@@ -1,0 +1,30 @@
+LIBRARY psqlodbc2w
+EXPORTS
+    SQLAllocHandle    @1
+    SQLFreeHandle     @2
+    SQLGetFunctions   @3
+    SQLDriverConnect  @4
+    SQLGetDiagRec     @5
+    SQLGetDiagField   @6
+    SQLConnect        @7
+    SQLDisconnect     @8
+    SQLPrepare        @9
+    SQLExecute        @10
+    SQLExecDirect     @11
+    SQLFreeStmt       @12
+    SQLNumResultCols  @13
+    SQLDescribeCol    @14
+    SQLRowCount       @15
+    SQLFetch          @16
+    SQLGetData        @17
+    SQLTables         @18
+    SQLColumns        @19
+    SQLPrimaryKeys    @20
+    SQLForeignKeys    @21
+    SQLBindParameter  @22
+    SQLSetConnectAttr @23
+    SQLGetConnectAttr @24
+    SQLEndTran        @25
+    SQLBindCol        @26
+    SQLSetStmtAttr    @27
+    SQLGetStmtAttr    @28

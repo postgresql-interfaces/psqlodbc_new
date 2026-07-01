@@ -1,0 +1,114 @@
+name: CI
+run-name: psqlodbc2 CI - ${{ github.event.head_commit.message }}
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux (Ubuntu)
+          - os: macos-latest
+            name: macOS
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    services:
+      postgres:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'postgres:17' || '' }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: contrib_regression
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          meson ninja-build \
+          libpq-dev unixodbc-dev libodbcinst2
+
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install meson ninja libpq unixodbc postgresql@17
+        brew services start postgresql@17
+        sleep 3
+        createdb contrib_regression || true
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure
+      run: meson setup builddir
+
+    - name: Build
+      run: meson compile -C builddir
+
+    - name: Test (unit tests)
+      run: meson test -C builddir
+      env:
+        PSQLODBC2_TEST_CONNSTR: ""
+
+    - name: Test (with PostgreSQL)
+      run: meson test -C builddir
+      env:
+        PSQLODBC2_TEST_CONNSTR: ${{ matrix.os == 'ubuntu-latest' && 'Server=localhost;Port=5432;Database=contrib_regression;UID=postgres;PWD=postgres' || 'Server=localhost;Port=5432;Database=contrib_regression' }}
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install meson and ninja
+      run: python -m pip install meson ninja
+
+    - name: Setup MSVC
+      uses: TheMrMilchmann/setup-msvc-dev@v3
+      with:
+        arch: x64
+
+    - name: Install PostgreSQL
+      shell: cmd
+      run: |
+        choco install postgresql17 --params "/Password:postgres /Port:5432" -y
+        refreshenv
+
+    - name: Configure
+      shell: cmd
+      run: |
+        set PATH=C:\Program Files\PostgreSQL\17\bin;%PATH%
+        set PKG_CONFIG_PATH=C:\Program Files\PostgreSQL\17\lib\pkgconfig
+        meson setup builddir -Ddriver_manager=none
+
+    - name: Build
+      run: meson compile -C builddir
+
+    - name: Test (unit tests)
+      run: meson test -C builddir
+      env:
+        PSQLODBC2_TEST_CONNSTR: ""

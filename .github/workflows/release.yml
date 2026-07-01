@@ -1,0 +1,83 @@
+name: Release
+run-name: psqlodbc2 Release - ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+            artifact_suffix: linux-x64
+          - os: macos-latest
+            name: macos-arm64
+            artifact_suffix: macos-arm64
+
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Install dependencies (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          meson ninja-build \
+          libpq-dev unixodbc-dev libodbcinst2
+
+    - name: Install dependencies (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        brew install meson ninja libpq unixodbc
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure (release)
+      run: meson setup builddir --buildtype=release --strip
+
+    - name: Build
+      run: meson compile -C builddir
+
+    - name: Package
+      run: |
+        mkdir -p dist
+        cp builddir/src/libpsqlodbc2w* dist/ 2>/dev/null || true
+        cp LICENSE dist/
+        tar -czf psqlodbc2-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz -C dist .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: psqlodbc2-${{ matrix.artifact_suffix }}
+        path: psqlodbc2-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz
+        retention-days: 5
+
+  create-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: ncipollo/release-action@v1.14.0
+      with:
+        makeLatest: true
+        draft: false
+        prerelease: false
+        artifacts: "artifacts/**/*.tar.gz"
