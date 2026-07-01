@@ -30,7 +30,13 @@
  * These provide the SQL* type definitions (SQLHANDLE, SQLRETURN, etc.)
  * and constant definitions (SQL_SUCCESS, SQL_HANDLE_ENV, etc.) that
  * the driver implementation depends on.
- */
+ *
+ * On Windows, sqltypes.h depends on types from windows.h (DWORD, etc.)
+ * so it must be included first. */
+
+#if defined(PSQLODBC2_PLATFORM_WINDOWS)
+#include <windows.h>
+#endif
 
 #include <sql.h>
 #include <sqlext.h>

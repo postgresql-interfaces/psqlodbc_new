@@ -172,7 +172,8 @@ static int test_libpq_string_builder(void)
     strcpy(info.port, "5432");
     strcpy(info.database, "testdb");
     strcpy(info.username, "user");
-    info.password = strdup("pass");
+    info.password = malloc(5);
+    memcpy(info.password, "pass", 5);
     strcpy(info.sslmode, "require");
     info.connect_timeout = 10;
 
