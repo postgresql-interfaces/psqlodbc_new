@@ -27,13 +27,19 @@
 /* ---- Shared Library Symbol Export ----
  *
  * PSQLODBC2_EXPORT marks functions that must be visible outside the shared
- * library (i.e., ODBC entry points). On Windows this uses __declspec(dllexport);
- * on Unix systems with GCC/Clang it uses visibility("default") paired with
- * -fvisibility=hidden at the compiler level (set via meson's gnu_symbol_visibility).
+ * library (i.e., ODBC entry points).
+ *
+ * On Windows: exports are handled by the .def file (psqlodbc2.def), not by
+ * __declspec(dllexport). Using dllexport would conflict with the ODBC function
+ * declarations in sql.h/sqlext.h which don't have dllexport, causing MSVC
+ * error C2375 "redefinition; different linkage".
+ *
+ * On Unix: uses visibility("default") paired with -fvisibility=hidden at the
+ * compiler level (set via meson's gnu_symbol_visibility).
  */
 
 #if defined(PSQLODBC2_PLATFORM_WINDOWS)
-    #define PSQLODBC2_EXPORT __declspec(dllexport)
+    #define PSQLODBC2_EXPORT
 #elif defined(__GNUC__) || defined(__clang__)
     #define PSQLODBC2_EXPORT __attribute__((visibility("default")))
 #else
