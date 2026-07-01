@@ -62,6 +62,8 @@ jobs:
 
     - name: Configure
       run: meson setup builddir
+      env:
+        PKG_CONFIG_PATH: ${{ matrix.os == 'macos-latest' && '/opt/homebrew/opt/libpq/lib/pkgconfig' || '' }}
 
     - name: Build
       run: meson compile -C builddir
@@ -93,17 +95,19 @@ jobs:
         arch: x64
 
     - name: Install PostgreSQL
-      shell: cmd
+      shell: powershell
       run: |
         choco install postgresql17 --params "/Password:postgres /Port:5432" -y
-        refreshenv
+        # Add PostgreSQL bin to PATH for this job
+        echo "C:\Program Files\PostgreSQL\17\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
     - name: Configure
-      shell: cmd
+      shell: powershell
       run: |
-        set PATH=C:\Program Files\PostgreSQL\17\bin;%PATH%
-        set PKG_CONFIG_PATH=C:\Program Files\PostgreSQL\17\lib\pkgconfig
+        $env:PKG_CONFIG_PATH = "C:\Program Files\PostgreSQL\17\lib\pkgconfig"
         meson setup builddir -Ddriver_manager=none
+      env:
+        PKG_CONFIG_PATH: C:\Program Files\PostgreSQL\17\lib\pkgconfig
 
     - name: Build
       run: meson compile -C builddir
@@ -112,3 +116,8 @@ jobs:
       run: meson test -C builddir
       env:
         PSQLODBC2_TEST_CONNSTR: ""
+
+    - name: Test (with PostgreSQL)
+      run: meson test -C builddir
+      env:
+        PSQLODBC2_TEST_CONNSTR: "Server=localhost;Port=5432;Database=postgres;UID=postgres;PWD=postgres"

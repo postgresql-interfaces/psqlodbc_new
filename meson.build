@@ -39,23 +39,66 @@ else  # auto
 endif
 
 # Locate PostgreSQL client library (libpq) for connecting to the database.
-# If pkg-config cannot find libpq automatically, check common install locations.
+# Strategy: try pkg-config first, then probe common install locations per platform.
 libpq_dep = dependency('libpq', required : false)
 if not libpq_dep.found()
     cc = meson.get_compiler('c')
-    # Check /usr/local/pgsql/18 (common for source builds on macOS)
-    libpq_lib = cc.find_library('pq',
-        dirs : ['/usr/local/pgsql/18/lib'],
-        required : false,
-    )
-    if libpq_lib.found() and cc.has_header('libpq-fe.h',
-        args : ['-I/usr/local/pgsql/18/include'])
-        libpq_dep = declare_dependency(
-            dependencies : libpq_lib,
-            include_directories : include_directories('/usr/local/pgsql/18/include'),
-        )
+
+    # Common library search paths by platform
+    libpq_search_dirs = []
+    libpq_include_args = []
+
+    if host_machine.system() == 'windows'
+        # Standard EDB/Chocolatey install paths on Windows
+        libpq_search_dirs = [
+            'C:/Program Files/PostgreSQL/17/lib',
+            'C:/Program Files/PostgreSQL/16/lib',
+            'C:/Program Files/PostgreSQL/15/lib',
+        ]
+        libpq_include_candidates = [
+            'C:/Program Files/PostgreSQL/17/include',
+            'C:/Program Files/PostgreSQL/16/include',
+            'C:/Program Files/PostgreSQL/15/include',
+        ]
     else
-        error('libpq not found. Set PKG_CONFIG_PATH to include libpq.pc location.')
+        # macOS source builds and Homebrew, Linux standard paths
+        libpq_search_dirs = [
+            '/usr/local/pgsql/18/lib',
+            '/usr/local/pgsql/17/lib',
+            '/opt/homebrew/opt/libpq/lib',
+        ]
+        libpq_include_candidates = [
+            '/usr/local/pgsql/18/include',
+            '/usr/local/pgsql/17/include',
+            '/opt/homebrew/opt/libpq/include',
+        ]
+    endif
+
+    libpq_lib = cc.find_library('pq', dirs : libpq_search_dirs, required : false)
+
+    if libpq_lib.found()
+        # Find the matching include directory
+        libpq_inc_dir = ''
+        foreach inc_path : libpq_include_candidates
+            if cc.has_header('libpq-fe.h', args : ['-I' + inc_path])
+                libpq_inc_dir = inc_path
+                break
+            endif
+        endforeach
+
+        if libpq_inc_dir != ''
+            libpq_dep = declare_dependency(
+                dependencies : libpq_lib,
+                include_directories : include_directories(libpq_inc_dir),
+            )
+        elif cc.has_header('libpq-fe.h')
+            # Header is in default include path already
+            libpq_dep = declare_dependency(dependencies : libpq_lib)
+        else
+            error('Found libpq library but not libpq-fe.h header. Install PostgreSQL development headers.')
+        endif
+    else
+        error('libpq not found. Install PostgreSQL client library or set PKG_CONFIG_PATH.')
     endif
 endif
 

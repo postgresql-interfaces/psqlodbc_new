@@ -16,19 +16,16 @@ test('driver_load', test_driver_load,
 # Connection string parsing tests (pure unit tests, no database needed).
 # Compiles the connection string source directly because these are internal
 # functions with hidden visibility (not exported from the shared library).
-# dsn_config.c is included because connection_string.c calls dsn_config_read.
-test_connection_string_deps = [odbc_dep, libpq_dep]
-if odbcinst_dep.found()
-    test_connection_string_deps += odbcinst_dep
-endif
-
+# Uses a stub dsn_config that always returns false, so the test doesn't
+# depend on libodbcinst or a working odbc.ini. DSN resolution is tested
+# separately in test_dsn_config.
 test_connection_string = executable('test_connection_string',
     'test_connection_string.c',
     '../src/connection_string.c',
-    '../src/dsn_config.c',
+    'dsn_config_stub.c',
     '../src/diagnostics.c',
     include_directories : [inc, include_directories('../src')],
-    dependencies : test_connection_string_deps,
+    dependencies : [odbc_dep, libpq_dep],
 )
 
 test('connection_string', test_connection_string,
