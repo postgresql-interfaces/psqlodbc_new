@@ -15,9 +15,24 @@
 #include "connection.h"
 #include "diagnostics.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Portable case-insensitive string comparison (strcasecmp is POSIX, not C11) */
+static int catalog_strcasecmp(const char *left, const char *right)
+{
+    while (*left && *right) {
+        int diff = tolower((unsigned char)*left) - tolower((unsigned char)*right);
+        if (diff != 0) {
+            return diff;
+        }
+        left++;
+        right++;
+    }
+    return tolower((unsigned char)*left) - tolower((unsigned char)*right);
+}
 #include <libpq-fe.h>
 
 /* Maximum size for catalog query strings. These queries have bounded size
@@ -237,33 +252,47 @@ SQLRETURN catalog_tables(OdbcStatement *statement,
             type_copy[copy_len] = '\0';
 
             /* Tokenize by comma */
-            char *saveptr = NULL;
-            char *token = strtok_r(type_copy, ",", &saveptr);
-            while (token) {
+            /* Tokenize by comma — portable replacement for strtok_r (POSIX, not C11) */
+            char *pos = type_copy;
+            while (*pos) {
+                /* Skip leading commas and spaces */
+                while (*pos == ',' || *pos == ' ') pos++;
+                if (!*pos) break;
+
+                /* Find end of token */
+                char *token_start = pos;
+                while (*pos && *pos != ',') pos++;
+                size_t tlen = (size_t)(pos - token_start);
+
+                /* Make a null-terminated copy for comparison */
+                char token_buf[64];
+                if (tlen >= sizeof(token_buf)) tlen = sizeof(token_buf) - 1;
+                memcpy(token_buf, token_start, tlen);
+                token_buf[tlen] = '\0';
+
                 /* Strip leading/trailing spaces and quotes */
+                char *token = token_buf;
                 while (*token == ' ' || *token == '\'') token++;
-                size_t tlen = strlen(token);
-                while (tlen > 0 && (token[tlen-1] == ' ' || token[tlen-1] == '\'')) {
-                    token[--tlen] = '\0';
+                size_t token_len = strlen(token);
+                while (token_len > 0 && (token[token_len-1] == ' ' || token[token_len-1] == '\'')) {
+                    token[--token_len] = '\0';
                 }
 
-                if (strcasecmp(token, "TABLE") == 0) {
+                if (catalog_strcasecmp(token, "TABLE") == 0) {
                     if (rk_offset > 0) relkinds[rk_offset++] = ',';
                     relkinds[rk_offset++] = '\''; relkinds[rk_offset++] = 'r'; relkinds[rk_offset++] = '\'';
                     relkinds[rk_offset++] = ',';
                     relkinds[rk_offset++] = '\''; relkinds[rk_offset++] = 'p'; relkinds[rk_offset++] = '\'';
-                } else if (strcasecmp(token, "VIEW") == 0) {
+                } else if (catalog_strcasecmp(token, "VIEW") == 0) {
                     if (rk_offset > 0) relkinds[rk_offset++] = ',';
                     relkinds[rk_offset++] = '\''; relkinds[rk_offset++] = 'v'; relkinds[rk_offset++] = '\'';
-                } else if (strcasecmp(token, "MATERIALIZED VIEW") == 0) {
+                } else if (catalog_strcasecmp(token, "MATERIALIZED VIEW") == 0) {
                     if (rk_offset > 0) relkinds[rk_offset++] = ',';
                     relkinds[rk_offset++] = '\''; relkinds[rk_offset++] = 'm'; relkinds[rk_offset++] = '\'';
-                } else if (strcasecmp(token, "FOREIGN TABLE") == 0) {
+                } else if (catalog_strcasecmp(token, "FOREIGN TABLE") == 0) {
                     if (rk_offset > 0) relkinds[rk_offset++] = ',';
                     relkinds[rk_offset++] = '\''; relkinds[rk_offset++] = 'f'; relkinds[rk_offset++] = '\'';
                 }
-
-                token = strtok_r(NULL, ",", &saveptr);
             }
             relkinds[rk_offset] = '\0';
 
