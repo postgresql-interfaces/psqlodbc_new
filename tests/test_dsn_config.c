@@ -15,6 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "dsn_config.h"
 
 /* Exit code 77 tells Meson the test was skipped (not failed) */
@@ -64,8 +68,26 @@ static int tests_passed = 0;
     tests_passed++; \
 } while (0)
 
-/* Path for the temporary odbc.ini used by these tests */
-static const char *TEMP_ODBC_INI = "/tmp/psqlodbc2_test_odbc.ini";
+/* Path for the temporary odbc.ini used by these tests.
+ * On Windows we use GetTempPath; on Unix we use /tmp. */
+#ifdef _WIN32
+static char temp_odbc_ini[MAX_PATH];
+#else
+static char temp_odbc_ini[512];
+#endif
+
+static void init_temp_path(void)
+{
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    snprintf(temp_odbc_ini, sizeof(temp_odbc_ini),
+             "%spsqlodbc2_test_odbc.ini", tmp);
+#else
+    snprintf(temp_odbc_ini, sizeof(temp_odbc_ini),
+             "/tmp/psqlodbc2_test_odbc.ini");
+#endif
+}
 
 /*
  * Write a test odbc.ini file with known DSN entries.
@@ -73,9 +95,9 @@ static const char *TEMP_ODBC_INI = "/tmp/psqlodbc2_test_odbc.ini";
  */
 static bool create_test_ini_file(void)
 {
-    FILE *ini_file = fopen(TEMP_ODBC_INI, "w");
+    FILE *ini_file = fopen(temp_odbc_ini, "w");
     if (!ini_file) {
-        fprintf(stderr, "Failed to create temp odbc.ini at %s\n", TEMP_ODBC_INI);
+        fprintf(stderr, "Failed to create temp odbc.ini at %s\n", temp_odbc_ini);
         return false;
     }
 
@@ -109,7 +131,7 @@ static bool create_test_ini_file(void)
 
 static void cleanup_test_ini_file(void)
 {
-    remove(TEMP_ODBC_INI);
+    remove(temp_odbc_ini);
 }
 
 static int test_read_full_dsn(void)
@@ -119,8 +141,8 @@ static int test_read_full_dsn(void)
     ConnectionInfo info;
     memset(&info, 0, sizeof(info));
 
-    bool result = dsn_config_read("testdsn", &info);
-    ASSERT_TRUE(result, "dsn_config_read should return true for existing DSN");
+    bool result = dsn_config_read_file("testdsn", &info, temp_odbc_ini);
+    ASSERT_TRUE(result, "dsn_config_read_file should return true for existing DSN");
 
     ASSERT_STREQ(info.server, "localhost", "Server should be 'localhost'");
     ASSERT_STREQ(info.port, "5432", "Port should be '5432'");
@@ -143,8 +165,8 @@ static int test_nonexistent_dsn(void)
     ConnectionInfo info;
     memset(&info, 0, sizeof(info));
 
-    bool result = dsn_config_read("nosuchdsn", &info);
-    ASSERT_FALSE(result, "dsn_config_read should return false for non-existent DSN");
+    bool result = dsn_config_read_file("nosuchdsn", &info, temp_odbc_ini);
+    ASSERT_FALSE(result, "dsn_config_read_file should return false for non-existent DSN");
 
     /* Verify nothing was written */
     ASSERT_STREQ(info.server, "", "Server should remain empty");
@@ -161,8 +183,8 @@ static int test_partial_dsn(void)
     ConnectionInfo info;
     memset(&info, 0, sizeof(info));
 
-    bool result = dsn_config_read("partialdsn", &info);
-    ASSERT_TRUE(result, "dsn_config_read should return true for partial DSN");
+    bool result = dsn_config_read_file("partialdsn", &info, temp_odbc_ini);
+    ASSERT_TRUE(result, "dsn_config_read_file should return true for partial DSN");
 
     ASSERT_STREQ(info.server, "dbhost.example.com", "Server should be 'dbhost.example.com'");
     ASSERT_STREQ(info.database, "proddb", "Database should be 'proddb'");
@@ -182,8 +204,8 @@ static int test_uid_alias(void)
     ConnectionInfo info;
     memset(&info, 0, sizeof(info));
 
-    bool result = dsn_config_read("uiddsn", &info);
-    ASSERT_TRUE(result, "dsn_config_read should return true for UID alias DSN");
+    bool result = dsn_config_read_file("uiddsn", &info, temp_odbc_ini);
+    ASSERT_TRUE(result, "dsn_config_read_file should return true for UID alias DSN");
 
     ASSERT_STREQ(info.server, "uidhost", "Server should be 'uidhost'");
     ASSERT_STREQ(info.username, "uiduser", "Username from UID key should be 'uiduser'");
@@ -204,8 +226,8 @@ static int test_existing_values_not_overwritten_by_empty(void)
 
     /* partialdsn only has Server and Database — it should NOT overwrite
      * port or username since those keys are empty in the DSN. */
-    bool result = dsn_config_read("partialdsn", &info);
-    ASSERT_TRUE(result, "dsn_config_read should return true");
+    bool result = dsn_config_read_file("partialdsn", &info, temp_odbc_ini);
+    ASSERT_TRUE(result, "dsn_config_read_file should return true");
 
     ASSERT_STREQ(info.server, "dbhost.example.com", "Server should be updated from DSN");
     ASSERT_STREQ(info.database, "proddb", "Database should be updated from DSN");
@@ -222,9 +244,12 @@ static int test_null_and_empty_dsn_name(void)
     ConnectionInfo info;
     memset(&info, 0, sizeof(info));
 
-    ASSERT_FALSE(dsn_config_read(NULL, &info), "NULL dsn_name should return false");
-    ASSERT_FALSE(dsn_config_read("", &info), "Empty dsn_name should return false");
-    ASSERT_FALSE(dsn_config_read("testdsn", NULL), "NULL out_info should return false");
+    ASSERT_FALSE(dsn_config_read_file(NULL, &info, temp_odbc_ini),
+                 "NULL dsn_name should return false");
+    ASSERT_FALSE(dsn_config_read_file("", &info, temp_odbc_ini),
+                 "Empty dsn_name should return false");
+    ASSERT_FALSE(dsn_config_read_file("testdsn", NULL, temp_odbc_ini),
+                 "NULL out_info should return false");
 
     return TEST_PASS;
 }
@@ -238,15 +263,13 @@ int main(void)
 #else
     printf("Running DSN config tests...\n");
 
-    /* Set up: create temp odbc.ini and point ODBCINI to it */
+    init_temp_path();
+
+    /* Set up: create temp odbc.ini */
     if (!create_test_ini_file()) {
         fprintf(stderr, "Failed to create test INI file\n");
         return TEST_FAIL;
     }
-
-    /* ODBCINI environment variable tells unixODBC where to find the user's
-     * odbc.ini file. We override it to use our test file. */
-    setenv("ODBCINI", TEMP_ODBC_INI, 1);
 
     int result = TEST_PASS;
 
@@ -259,7 +282,6 @@ int main(void)
 
     /* Clean up */
     cleanup_test_ini_file();
-    unsetenv("ODBCINI");
 
     printf("\n  Results: %d/%d tests passed\n", tests_passed, tests_run);
     return result;

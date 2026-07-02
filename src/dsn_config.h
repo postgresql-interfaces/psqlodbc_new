@@ -53,4 +53,18 @@
  */
 bool dsn_config_read(const char *dsn_name, ConnectionInfo *out_info);
 
+/*
+ * Read connection parameters for the named DSN from a specific INI file.
+ *
+ * Same behavior as dsn_config_read, but reads from the specified file path
+ * instead of the system ODBC configuration. On Windows, a full path causes
+ * SQLGetPrivateProfileString to read from the file rather than the registry.
+ * On Unix (unixODBC), the filename is passed directly.
+ *
+ * This is primarily useful for testing without modifying the system ODBC
+ * configuration.
+ */
+bool dsn_config_read_file(const char *dsn_name, ConnectionInfo *out_info,
+                          const char *ini_file);
+
 #endif /* PSQLODBC2_DSN_CONFIG_H */
