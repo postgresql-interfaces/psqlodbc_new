@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <sql.h>
 #include <sqltypes.h>
 #include <sqlext.h>
@@ -27,7 +30,7 @@
     #define LIB_HANDLE               HMODULE
     #define LIB_ERROR_MSG()          "LoadLibrary failed"
 #else
-    #include <dlfcn.h>
+    #include "test_platform.h"
     #define LOAD_LIBRARY(path)       dlopen(path, RTLD_NOW)
     #define GET_SYMBOL(lib, name)    dlsym(lib, name)
     #define CLOSE_LIBRARY(lib)       dlclose(lib)

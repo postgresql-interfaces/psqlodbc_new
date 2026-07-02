@@ -86,28 +86,62 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install meson and ninja
-      run: python -m pip install meson ninja
+    - name: Install meson, ninja, and pkgconf
+      run: python -m pip install meson ninja pkgconf
 
     - name: Setup MSVC
       uses: TheMrMilchmann/setup-msvc-dev@v3
       with:
         arch: x64
 
+    - name: Remove Strawberry Perl from PATH
+      shell: powershell
+      run: |
+        # Strawberry Perl injects ccache and a broken pkg-config into PATH
+        $cleanPath = ($env:PATH -split ';' | Where-Object { $_ -notlike '*Strawberry*' }) -join ';'
+        echo "PATH=$cleanPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
     - name: Install PostgreSQL
       shell: powershell
       run: |
         choco install postgresql17 --params "/Password:postgres /Port:5432" -y
-        # Add PostgreSQL bin to PATH for this job
+        # Add PostgreSQL bin to PATH for DLL loading at runtime
         echo "C:\Program Files\PostgreSQL\17\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+    - name: Fix libpq.pc prefix
+      shell: powershell
+      run: |
+        # The choco-installed PostgreSQL ships a libpq.pc with the build machine's
+        # prefix path baked in. Rewrite it to point to the actual install location.
+        $pgDir = "C:/Program Files/PostgreSQL/17"
+        $pcDir = "$pgDir/lib/pkgconfig"
+        if (Test-Path "$pcDir/libpq.pc") {
+          @"
+        prefix=$pgDir
+        includedir=`${prefix}/include
+        libdir=`${prefix}/lib
+
+        Name: libpq
+        Description: PostgreSQL libpq library
+        Version: 17
+        Libs: -L`${libdir} -lpq
+        Cflags: -I`${includedir}
+        "@ | Set-Content "$pcDir/libpq.pc"
+        }
 
     - name: Configure
       shell: powershell
       run: |
-        $env:PKG_CONFIG_PATH = "C:\Program Files\PostgreSQL\17\lib\pkgconfig"
-        meson setup builddir -Ddriver_manager=none
-      env:
-        PKG_CONFIG_PATH: C:\Program Files\PostgreSQL\17\lib\pkgconfig
+        # Create native file to use pkgconf-pypi (avoids broken pkg-config)
+        @"
+        [binaries]
+        pkg-config = 'pkgconf-pypi'
+
+        [built-in options]
+        pkg_config_path = 'C:/Program Files/PostgreSQL/17/lib/pkgconfig'
+        "@ | Set-Content native.ini
+
+        meson setup builddir -Ddriver_manager=none --native-file=native.ini
 
     - name: Build
       run: meson compile -C builddir
