@@ -89,6 +89,23 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
         safe_copy_to_buffer(timeout_buffer, sizeof(timeout_buffer), value, value_length);
         info->connect_timeout = (unsigned int)strtoul(timeout_buffer, NULL, 10);
 
+    } else if (case_insensitive_compare(key, "BoolsAsChar") == 0) {
+        /* Any non-zero integer enables describing bool columns as VARCHAR(5).
+         * A value of "0" turns it off, exposing bool as SQL_BIT instead. */
+        char bool_buffer[16];
+        safe_copy_to_buffer(bool_buffer, sizeof(bool_buffer), value, value_length);
+        info->bools_as_char = (strtol(bool_buffer, NULL, 10) != 0);
+
+    } else if (case_insensitive_compare(key, "UnknownSizes") == 0) {
+        char size_buffer[16];
+        safe_copy_to_buffer(size_buffer, sizeof(size_buffer), value, value_length);
+        info->unknown_sizes = (int)strtol(size_buffer, NULL, 10);
+
+    } else if (case_insensitive_compare(key, "MaxVarcharSize") == 0) {
+        char size_buffer[16];
+        safe_copy_to_buffer(size_buffer, sizeof(size_buffer), value, value_length);
+        info->max_varchar_size = (int)strtol(size_buffer, NULL, 10);
+
     } else if (case_insensitive_compare(key, "DSN") == 0) {
         /* Resolve the DSN from odbc.ini to populate connection defaults.
          * Subsequent keys in the connection string will override these values

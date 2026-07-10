@@ -234,10 +234,17 @@ static void test_prepare_invalid_sql(void)
     result = fn_alloc_handle(SQL_HANDLE_STMT, connection_handle, &statement);
     assert(result == SQL_SUCCESS);
 
+    /* With server-side prepare, parse errors are deferred to execution time
+     * (matching the original psqlodbc driver). SQLPrepare succeeds; the error
+     * surfaces at SQLExecute. This is the ODBC-conformant behavior for drivers
+     * that prepare on the server. */
     result = fn_prepare(statement, (SQLCHAR *)"INVALID SQL SYNTAX HERE!!!", SQL_NTS);
+    assert(result == SQL_SUCCESS);
+
+    result = fn_execute(statement);
     assert(result == SQL_ERROR);
 
-    /* Verify diagnostic */
+    /* Verify diagnostic is available after the failed execute */
     SQLCHAR message[512];
     SQLCHAR sqlstate[6];
     SQLINTEGER native_error;

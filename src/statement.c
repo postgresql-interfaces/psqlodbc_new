@@ -14,12 +14,41 @@
 #include "statement.h"
 #include "connection.h"
 #include "error_mapping.h"
+#include "query_parser.h"
+#include "type_mapping.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 /* ---- Internal Helpers ---- */
+
+/*
+ * Populate a per-position cast-suffix array from the statement's parameter
+ * bindings, for use by query_translate_markers.
+ *
+ * casts_out must have MAX_PARAMETERS entries. Each entry is set to the cast
+ * suffix (e.g. "::int4") implied by the bound parameter's SQL type, or NULL
+ * when the parameter is unbound or needs no cast. The returned strings are
+ * static constants owned by type_mapping and must not be freed.
+ *
+ * Applying casts at ExecDirect time — where bindings are known before the SQL
+ * is translated — lets PostgreSQL interpret each value as the SQL type the
+ * application declared, rather than as an untyped string literal. This mirrors
+ * the original psqlodbc's use of sqltype_to_pgcast().
+ */
+static void build_parameter_casts(const OdbcStatement *statement,
+                                  const char *casts_out[MAX_PARAMETERS])
+{
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        if (statement->parameter_bindings[index].is_bound) {
+            casts_out[index] =
+                type_mapping_get_param_cast(statement->parameter_bindings[index].sql_type);
+        } else {
+            casts_out[index] = NULL;
+        }
+    }
+}
 
 /*
  * Resolve the actual byte length of a SQL text argument.
@@ -49,6 +78,10 @@ static void clear_current_result(OdbcStatement *statement)
     if (statement->current_result) {
         PQclear(statement->current_result);
         statement->current_result = NULL;
+    }
+    if (statement->describe_result) {
+        PQclear(statement->describe_result);
+        statement->describe_result = NULL;
     }
     statement->affected_row_count = -1;
     statement->has_result_set = false;
@@ -89,6 +122,21 @@ static SQLRETURN handle_execution_result(OdbcStatement *statement, PGresult *res
         statement->has_result_set = true;
         statement->affected_row_count = PQntuples(result);
         statement->state = STATEMENT_STATE_HAS_CURSOR;
+
+        /* If the connection captured NOTICE messages during execution, promote
+         * them to ODBC diagnostic records and return SQL_SUCCESS_WITH_INFO. */
+        if (statement->parent_connection &&
+            statement->parent_connection->notice_count > 0) {
+            OdbcConnection *conn = statement->parent_connection;
+            for (int i = 0; i < conn->notice_count; i++) {
+                diagnostics_add_record(&statement->diagnostics,
+                                       "00000",  /* Notice — matches original psqlodbc behavior */
+                                       0,
+                                       conn->captured_notices[i]);
+            }
+            connection_clear_notices(conn);
+            return SQL_SUCCESS_WITH_INFO;
+        }
         return SQL_SUCCESS;
 
     case PGRES_COMMAND_OK: {
@@ -103,6 +151,20 @@ static SQLRETURN handle_execution_result(OdbcStatement *statement, PGresult *res
         statement->has_result_set = false;
         statement->state = STATEMENT_STATE_EXECUTED;
         PQclear(result);
+
+        /* Promote any captured NOTICE messages to diagnostics */
+        if (statement->parent_connection &&
+            statement->parent_connection->notice_count > 0) {
+            OdbcConnection *conn = statement->parent_connection;
+            for (int i = 0; i < conn->notice_count; i++) {
+                diagnostics_add_record(&statement->diagnostics,
+                                       "00000",  /* Notice — matches original psqlodbc behavior */
+                                       0,
+                                       conn->captured_notices[i]);
+            }
+            connection_clear_notices(conn);
+            return SQL_SUCCESS_WITH_INFO;
+        }
         return SQL_SUCCESS;
     }
 
@@ -110,7 +172,8 @@ static SQLRETURN handle_execution_result(OdbcStatement *statement, PGresult *res
         /* Extract the actual SQLSTATE from PostgreSQL (e.g., "42601" for syntax
          * error, "23505" for unique violation) instead of generic "HY000". */
         diagnostics_clear(&statement->diagnostics);
-        error_add_diagnostic_from_result(&statement->diagnostics, result, "HY000");
+        error_add_diagnostic_from_result_ctx(&statement->diagnostics, result, "HY000",
+                                             "Error while executing the query");
         PQclear(result);
 
         /* Mark the transaction as failed so subsequent commands are rejected
@@ -221,6 +284,12 @@ SQLRETURN statement_free(SQLHANDLE handle)
     /* Deallocate server-side prepared statement if one exists */
     deallocate_server_prepared_statement(statement);
 
+    /* Release any deferred prepare error result */
+    if (statement->deferred_prepare_error) {
+        PQclear(statement->deferred_prepare_error);
+        statement->deferred_prepare_error = NULL;
+    }
+
     /* Clear the PGresult if any */
     clear_current_result(statement);
 
@@ -235,9 +304,11 @@ SQLRETURN statement_free(SQLHANDLE handle)
         connection_remove_statement(statement->parent_connection, statement);
     }
 
-    /* Free heap-allocated SQL text */
+    /* Free heap-allocated SQL text and translated SQL */
     free(statement->sql_text);
     statement->sql_text = NULL;
+    free(statement->translated_sql);
+    statement->translated_sql = NULL;
 
     /* Clear diagnostics */
     diagnostics_clear(&statement->diagnostics);
@@ -296,41 +367,75 @@ SQLRETURN statement_prepare(OdbcStatement *statement,
     memcpy(statement->sql_text, sql_text, actual_length);
     statement->sql_text[actual_length] = '\0';
 
+    /* Translate ODBC '?' parameter markers to PostgreSQL '$N' markers.
+     * At SQLPrepare time the application has not yet bound parameters (binding
+     * follows prepare), so no cast information is available; PostgreSQL infers
+     * the parameter types from the prepared statement instead. */
+    free(statement->translated_sql);
+    statement->translated_sql = query_translate_markers(statement->sql_text,
+                                                        &statement->detected_param_count,
+                                                        NULL, 0);
+    if (!statement->translated_sql) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY001",  /* Memory allocation error */
+                               0,
+                               "Cannot prepare: memory allocation failed for parameter translation.");
+        return SQL_ERROR;
+    }
+
     /* Generate a unique server-side prepared statement name */
     snprintf(statement->prepared_name, MAX_PREPARED_NAME_LENGTH,
              "_psqlodbc2_stmt_%d", statement->parent_connection->next_statement_id++);
 
-    /* Send PQprepare to the server (no parameter types — let PostgreSQL infer) */
+    /* Send PQprepare to the server using the translated SQL (with $N markers) */
     PGconn *libpq_connection = statement->parent_connection->libpq_connection;
     PGresult *prepare_result = PQprepare(libpq_connection,
                                          statement->prepared_name,
-                                         statement->sql_text,
+                                         statement->translated_sql,
                                          0,    /* number of parameters */
                                          NULL  /* let server infer parameter types */);
 
     if (!prepare_result || PQresultStatus(prepare_result) != PGRES_COMMAND_OK) {
-        diagnostics_clear(&statement->diagnostics);
-        if (prepare_result) {
-            /* Extract the actual SQLSTATE from PostgreSQL (e.g., "42601" for
-             * syntax error) rather than assuming "42000". */
-            error_add_diagnostic_from_result(&statement->diagnostics,
-                                            prepare_result, "42000");
-            PQclear(prepare_result);
-        } else {
-            /* NULL result means connection was likely lost */
-            diagnostics_add_record(&statement->diagnostics,
-                                   "08S01",  /* Communication link failure */
-                                   0,
-                                   "PQprepare returned NULL (connection may be lost).");
+        /* Defer parse/prepare errors to SQLExecute time. ODBC applications
+         * commonly SQLPrepare, then SQLBindParameter, then SQLExecute, and
+         * expect the diagnostic to surface at execution (the original psqlodbc
+         * driver behaves this way with deferred/server-side prepare). We keep
+         * the failing PGresult so SQLExecute can report it with the proper
+         * "Error while preparing parameters" context. */
+        if (statement->deferred_prepare_error) {
+            PQclear(statement->deferred_prepare_error);
         }
+        statement->deferred_prepare_error = prepare_result;  /* may be NULL */
         statement->prepared_name[0] = '\0';
-        statement->is_prepared = false;
-        return SQL_ERROR;
+        /* Mark as prepared so SQLExecute runs and emits the deferred error
+         * instead of a "function sequence" error. */
+        statement->is_prepared = true;
+        statement->state = STATEMENT_STATE_PREPARED;
+        return SQL_SUCCESS;
     }
 
+    if (statement->deferred_prepare_error) {
+        PQclear(statement->deferred_prepare_error);
+        statement->deferred_prepare_error = NULL;
+    }
     PQclear(prepare_result);
     statement->is_prepared = true;
     statement->state = STATEMENT_STATE_PREPARED;
+
+    /* Call PQdescribePrepared to get column metadata before execution.
+     * This enables SQLNumResultCols and SQLDescribeCol to work after
+     * SQLPrepare but before SQLExecute (required by ODBC spec). */
+    PGresult *describe_result = PQdescribePrepared(libpq_connection,
+                                                    statement->prepared_name);
+    if (describe_result && PQresultStatus(describe_result) == PGRES_COMMAND_OK) {
+        statement->describe_result = describe_result;
+    } else {
+        /* If describe fails, we still consider the prepare successful —
+         * metadata just won't be available until after execution. */
+        if (describe_result) {
+            PQclear(describe_result);
+        }
+    }
 
     return SQL_SUCCESS;
 }
@@ -361,14 +466,33 @@ SQLRETURN statement_execute(OdbcStatement *statement)
         return SQL_ERROR;
     }
 
-    /* If autocommit is OFF, ensure we're inside a transaction (implicit BEGIN) */
-    SQLRETURN txn_result = connection_ensure_transaction(statement->parent_connection);
-    if (txn_result != SQL_SUCCESS) {
-        diagnostics_add_record(&statement->diagnostics,
-                               "HY000",
-                               0,
-                               "Failed to begin implicit transaction.");
+    /* If SQLPrepare failed to parse the statement, the error was deferred to
+     * now (see statement_prepare). Report it with the preparing-parameters
+     * context that ODBC applications expect. */
+    if (statement->deferred_prepare_error) {
+        diagnostics_clear(&statement->diagnostics);
+        error_add_diagnostic_from_result_ctx(&statement->diagnostics,
+                                             statement->deferred_prepare_error,
+                                             "42000",
+                                             "Error while preparing parameters");
+        PQclear(statement->deferred_prepare_error);
+        statement->deferred_prepare_error = NULL;
         return SQL_ERROR;
+    }
+
+    /* If autocommit is OFF, ensure we're inside a transaction — UNLESS the
+     * command is transaction-exempt (e.g., VACUUM). Use the original sql_text
+     * for detection since translated_sql might have $N markers but same keywords. */
+    const char *sql_for_check = statement->sql_text ? statement->sql_text : "";
+    if (!query_is_transaction_exempt(sql_for_check)) {
+        SQLRETURN txn_result = connection_ensure_transaction(statement->parent_connection);
+        if (txn_result != SQL_SUCCESS) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY000",
+                                   0,
+                                   "Failed to begin implicit transaction.");
+            return SQL_ERROR;
+        }
     }
 
     /* Close any previous result from a prior execution */
@@ -377,8 +501,10 @@ SQLRETURN statement_execute(OdbcStatement *statement)
     PGconn *libpq_connection = statement->parent_connection->libpq_connection;
     PGresult *result = NULL;
 
-    if (statement->bound_parameter_count > 0) {
-        /* Build parameter arrays from bound values for PQexecPrepared */
+    if (statement->bound_parameter_count > 0 && statement->detected_param_count > 0) {
+        /* Build parameter arrays from bound values for PQexecPrepared.
+         * Cap the parameter count to what the SQL actually requires — apps may
+         * have stale bindings from a previous prepare that used more params. */
         const char **param_values = NULL;
         int *param_lengths = NULL;
         int *param_formats = NULL;
@@ -397,9 +523,15 @@ SQLRETURN statement_execute(OdbcStatement *statement)
             return SQL_ERROR;
         }
 
+        /* Only send as many params as the prepared SQL expects */
+        int effective_param_count = param_count;
+        if (effective_param_count > statement->detected_param_count) {
+            effective_param_count = statement->detected_param_count;
+        }
+
         result = PQexecPrepared(libpq_connection,
                                 statement->prepared_name,
-                                param_count,
+                                effective_param_count,
                                 param_values,
                                 param_lengths,
                                 param_formats,
@@ -407,7 +539,7 @@ SQLRETURN statement_execute(OdbcStatement *statement)
 
         parameter_free_libpq_arrays(param_values, param_lengths, param_formats, param_count);
     } else {
-        /* No parameters bound — execute without parameters */
+        /* No parameters bound or no parameter markers — execute without parameters */
         result = PQexecPrepared(libpq_connection,
                                 statement->prepared_name,
                                 0,     /* number of parameters */
@@ -439,19 +571,16 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
         return SQL_ERROR;
     }
 
-    /* If autocommit is OFF, ensure we're inside a transaction (implicit BEGIN) */
-    SQLRETURN txn_result = connection_ensure_transaction(statement->parent_connection);
-    if (txn_result != SQL_SUCCESS) {
-        diagnostics_add_record(&statement->diagnostics,
-                               "HY000",
-                               0,
-                               "Failed to begin implicit transaction.");
-        return SQL_ERROR;
-    }
-
     /* If this statement previously had a server-side prepared statement,
      * deallocate it since ExecDirect does not use prepared statements */
     deallocate_server_prepared_statement(statement);
+
+    /* Drop any deferred prepare error from a prior SQLPrepare — ExecDirect
+     * replaces the statement text entirely. */
+    if (statement->deferred_prepare_error) {
+        PQclear(statement->deferred_prepare_error);
+        statement->deferred_prepare_error = NULL;
+    }
 
     /* Close any existing result */
     clear_current_result(statement);
@@ -478,6 +607,39 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
     memcpy(statement->sql_text, sql_text, actual_length);
     statement->sql_text[actual_length] = '\0';
 
+    /* Translate ODBC '?' parameter markers to PostgreSQL '$N' markers.
+     * Bindings are already known at ExecDirect time, so we append type casts
+     * ($N::int4, etc.) derived from each bound parameter's declared SQL type. */
+    const char *parameter_casts[MAX_PARAMETERS];
+    build_parameter_casts(statement, parameter_casts);
+
+    free(statement->translated_sql);
+    statement->translated_sql = query_translate_markers(statement->sql_text,
+                                                        &statement->detected_param_count,
+                                                        parameter_casts,
+                                                        MAX_PARAMETERS);
+    if (!statement->translated_sql) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY001",  /* Memory allocation error */
+                               0,
+                               "Cannot execute: memory allocation failed for parameter translation.");
+        return SQL_ERROR;
+    }
+
+    /* If autocommit is OFF, ensure we're inside a transaction — UNLESS the
+     * command is transaction-exempt (e.g., VACUUM, CREATE DATABASE). Those
+     * commands cannot run inside a transaction block. */
+    if (!query_is_transaction_exempt(statement->translated_sql)) {
+        SQLRETURN txn_result = connection_ensure_transaction(statement->parent_connection);
+        if (txn_result != SQL_SUCCESS) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY000",
+                                   0,
+                                   "Failed to begin implicit transaction.");
+            return SQL_ERROR;
+        }
+    }
+
     /* Direct execution does not create a server-side prepared statement */
     statement->is_prepared = false;
     statement->prepared_name[0] = '\0';
@@ -485,10 +647,13 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
     PGconn *libpq_connection = statement->parent_connection->libpq_connection;
     PGresult *result = NULL;
 
-    if (statement->bound_parameter_count > 0) {
-        /* Use PQexecParams when parameters are bound — this sends the SQL text
-         * and parameter values to PostgreSQL in a single round-trip without
-         * creating a named prepared statement. */
+    /* Only use PQexecParams if the SQL actually contains parameter markers.
+     * The bound_parameter_count reflects what the app bound, but the actual
+     * SQL may have fewer (or zero) markers. For example, after executing a
+     * prepared statement with params, the app might do ExecDirect on a plain
+     * SQL string without resetting params — we must not send params in that case. */
+    if (statement->detected_param_count > 0 && statement->bound_parameter_count > 0) {
+        /* Use PQexecParams when the SQL has parameter markers and params are bound */
         const char **param_values = NULL;
         int *param_lengths = NULL;
         int *param_formats = NULL;
@@ -508,7 +673,7 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
         }
 
         result = PQexecParams(libpq_connection,
-                              statement->sql_text,
+                              statement->translated_sql,
                               param_count,
                               NULL,          /* Let PostgreSQL infer parameter types */
                               param_values,
@@ -518,8 +683,8 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
 
         parameter_free_libpq_arrays(param_values, param_lengths, param_formats, param_count);
     } else {
-        /* No parameters — use simple PQexec */
-        result = PQexec(libpq_connection, statement->sql_text);
+        /* No parameter markers in SQL — use simple PQexec */
+        result = PQexec(libpq_connection, statement->translated_sql);
     }
 
     return handle_execution_result(statement, result);

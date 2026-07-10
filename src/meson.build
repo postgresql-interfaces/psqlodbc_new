@@ -12,6 +12,7 @@ driver_sources = files(
     'results.c',
     'catalog.c',
     'error_mapping.c',
+    'query_parser.c',
     'odbc_api.c',
 )
 

@@ -204,3 +204,43 @@ const char *type_mapping_get_type_name(unsigned int postgres_oid)
     }
     return "unknown";
 }
+
+const char *type_mapping_get_param_cast(SQLSMALLINT sql_type)
+{
+    switch (sql_type) {
+    case SQL_BINARY:
+    case SQL_VARBINARY:
+        return "::bytea";
+    case SQL_TYPE_DATE:
+    case SQL_DATE:
+        return "::date";
+    case SQL_DECIMAL:
+    case SQL_NUMERIC:
+        return "::numeric";
+    case SQL_BIGINT:
+        return "::int8";
+    case SQL_INTEGER:
+        return "::int4";
+    case SQL_REAL:
+        return "::float4";
+    /* SQL_FLOAT and SQL_DOUBLE are intentionally left uncast, matching the
+     * original driver. PostgreSQL infers the parameter type from context
+     * (e.g. the numeric literal on the other side of a comparison), which
+     * yields correct results and a "numeric" error for malformed input. */
+    case SQL_SMALLINT:
+    case SQL_TINYINT:
+        return "::int2";
+    case SQL_TIME:
+    case SQL_TYPE_TIME:
+        return "::time";
+    case SQL_TIMESTAMP:
+    case SQL_TYPE_TIMESTAMP:
+        return "::timestamp";
+    case SQL_GUID:
+        return "::uuid";
+    default:
+        /* SQL_CHAR, SQL_VARCHAR, SQL_LONGVARCHAR and anything else: no cast,
+         * so the value is treated as text by PostgreSQL. */
+        return NULL;
+    }
+}

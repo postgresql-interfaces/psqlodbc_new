@@ -56,7 +56,20 @@ typedef struct OdbcStatement {
     char *sql_text;                    /* Heap-allocated SQL string from SQLPrepare/SQLExecDirect */
     char prepared_name[MAX_PREPARED_NAME_LENGTH]; /* Server-side prepared statement name */
     bool is_prepared;                  /* True if PQprepare was called for this statement */
+    char *translated_sql;              /* Heap-allocated SQL with ? translated to $N (NULL if none) */
+    int detected_param_count;          /* Number of ? markers found during translation */
+    PGresult *describe_result;         /* Result from PQdescribePrepared (for pre-execute metadata) */
+    PGresult *deferred_prepare_error;  /* If PQprepare failed, the error is deferred to SQLExecute
+                                        * time (matches original psqlodbc). NULL if prepare succeeded. */
     PGresult *current_result;          /* libpq result from last execution (NULL if none) */
+
+    /* Multi-statement support: a single SQLExecDirect of "SELECT 1; SELECT 2"
+     * produces several result sets. We collect them all here and step through
+     * them with SQLMoreResults. pending_results owns the results NOT yet made
+     * current; current_result above is the one being fetched. */
+    PGresult **pending_results;        /* Queue of not-yet-consumed result sets */
+    int pending_result_count;          /* Number of entries in pending_results */
+    int pending_result_index;          /* Index of the next result to promote */
     int affected_row_count;            /* Row count for INSERT/UPDATE/DELETE (-1 if unknown) */
     bool has_result_set;               /* True if the last execution produced rows (SELECT) */
     int current_row_position;          /* Cursor: -1 = before first row; 0..N-1 = row index */

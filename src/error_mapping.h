@@ -80,6 +80,18 @@ void error_add_diagnostic_from_result(DiagnosticRecords *diagnostics,
                                       const char *fallback_sqlstate);
 
 /*
+ * Like error_add_diagnostic_from_result, but appends a driver-level context
+ * string to the message (joined with ";\n"), matching the original psqlodbc
+ * diagnostic format. driver_context describes the operation that failed, e.g.
+ * "Error while executing the query" or "Error while preparing parameters".
+ * Pass NULL for driver_context to behave identically to the non-ctx variant.
+ */
+void error_add_diagnostic_from_result_ctx(DiagnosticRecords *diagnostics,
+                                          const PGresult *result,
+                                          const char *fallback_sqlstate,
+                                          const char *driver_context);
+
+/*
  * Convenience: extract error from a PGconn and add it as a diagnostic record.
  *
  * For connection-level errors where no PGresult is available. Uses

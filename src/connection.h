@@ -68,7 +68,40 @@ typedef struct ConnectionInfo {
     char sslmode[32];
     char application_name[256];
     unsigned int connect_timeout;
+
+    /* When true (the driver default, matching the original psqlodbc), PostgreSQL
+     * boolean columns are described to the application as SQL_VARCHAR(5) rather
+     * than SQL_BIT. Some applications (notably MS Access) cannot handle a true
+     * BIT type and expect the textual "true"/"false"/"1"/"0" representation.
+     * Controlled by the "BoolsAsChar" connection-string keyword. */
+    bool bools_as_char;
+
+    /* How the driver reports the size of variable-length columns whose maximum
+     * length is not declared (e.g. unbounded text/varchar). Controlled by the
+     * "UnknownSizes" connection-string keyword. See UNKNOWN_SIZES_* constants. */
+    int unknown_sizes;
+
+    /* Maximum size (in characters) reported for varchar/char columns without a
+     * declared length limit. Controlled by the "MaxVarcharSize" keyword. */
+    int max_varchar_size;
 } ConnectionInfo;
+
+/* Values for ConnectionInfo.unknown_sizes, matching the original psqlodbc.
+ * MAX:     report the driver's configured maximum size for the type.
+ * DONTKNOW: report "size unknown" (0), letting the application decide.
+ * LONGEST:  report the length of the longest value actually present in the
+ *           result set (requires scanning the fetched rows). */
+#define UNKNOWN_SIZES_MAX      0
+#define UNKNOWN_SIZES_DONTKNOW 1
+#define UNKNOWN_SIZES_LONGEST  2
+
+/* Default maximum size (in characters) for varchar/char columns without a
+ * declared length limit, matching the original psqlodbc's MAX_VARCHAR_SIZE. */
+#define DEFAULT_MAX_VARCHAR_SIZE 255
+
+/* Maximum size (in characters) for text/longvarchar columns without a declared
+ * length limit, matching the original psqlodbc's TEXT_FIELD_SIZE. */
+#define DEFAULT_MAX_LONGVARCHAR_SIZE 8190
 
 /* ---- Connection Handle ---- */
 
@@ -81,6 +114,11 @@ typedef struct ConnectionInfo {
  * dynamic allocation overhead for what is a bookkeeping list. */
 #define MAX_STATEMENTS_PER_CONNECTION 256
 
+/* Maximum number of NOTICE messages captured between statement executions.
+ * PostgreSQL can emit multiple notices during a single command (e.g., cascading
+ * drops), so we store several but cap it to avoid unbounded memory growth. */
+#define MAX_CAPTURED_NOTICES 16
+
 typedef struct OdbcConnection {
     unsigned int magic_number;       /* Must equal CONNECTION_MAGIC_NUMBER when valid */
     ConnectionState state;
@@ -91,6 +129,12 @@ typedef struct OdbcConnection {
     bool autocommit;
     int server_version_major;
     int server_version_minor;
+
+    /* Maximum number of bytes a single character occupies in the client
+     * encoding (e.g. 4 for UTF-8, 1 for LATIN1). Used to convert a column's
+     * character-count size into a worst-case byte length (octet length).
+     * Populated at connect time from the negotiated client encoding. */
+    int max_bytes_per_char;
     struct OdbcStatement *statements[MAX_STATEMENTS_PER_CONNECTION];
     int statement_count;
     int next_statement_id;  /* Counter for generating unique prepared statement names */
@@ -101,7 +145,19 @@ typedef struct OdbcConnection {
     SQLUINTEGER login_timeout;       /* Seconds; applied at connect time via connect_timeout */
     SQLUINTEGER connection_timeout;  /* Seconds; 0 = no timeout (informational only for PG) */
     SQLUINTEGER access_mode;         /* SQL_MODE_READ_WRITE or SQL_MODE_READ_ONLY */
+
+    /* NOTICE capture: libpq's notice receiver stores messages here between
+     * statement executions. After execution, they are promoted to diagnostic
+     * records with SQLSTATE "01000" (General warning). */
+    char *captured_notices[MAX_CAPTURED_NOTICES];  /* heap-allocated strings */
+    int notice_count;
 } OdbcConnection;
+
+/*
+ * Clear all captured notices, freeing the heap-allocated message strings.
+ * Called after notices have been promoted to diagnostic records on a statement.
+ */
+void connection_clear_notices(OdbcConnection *connection);
 
 /* ---- Public Interface ---- */
 

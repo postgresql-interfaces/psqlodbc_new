@@ -1,0 +1,3 @@
+# Generated regression test artifacts: compiled test binaries, generated
+# odbc.ini/odbcinst.ini, and captured results. Only run_regression.sh is tracked.
+work/

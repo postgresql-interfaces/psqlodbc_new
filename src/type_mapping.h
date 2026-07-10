@@ -39,8 +39,14 @@
 #define PG_TYPE_TIME        1083
 #define PG_TYPE_TIMESTAMP   1114
 #define PG_TYPE_TIMESTAMPTZ 1184
+#define PG_TYPE_INTERVAL    1186
 #define PG_TYPE_NUMERIC     1700
 #define PG_TYPE_UUID        2950
+
+/* Column size reported for a boolean column when the BoolsAsChar option is on.
+ * Wide enough to hold the textual representation "false". Matches the original
+ * psqlodbc driver's PG_WIDTH_OF_BOOLS_AS_CHAR. */
+#define PG_WIDTH_OF_BOOLS_AS_CHAR 5
 
 /* ---- Public Interface ---- */
 
@@ -77,5 +83,22 @@ SQLSMALLINT type_mapping_get_decimal_digits(unsigned int postgres_oid, int type_
  * Returns "unknown" for unrecognized OIDs.
  */
 const char *type_mapping_get_type_name(unsigned int postgres_oid);
+
+/*
+ * Return the PostgreSQL cast suffix (e.g. "::int4") for a bound parameter's
+ * SQL type, or NULL when no cast is appropriate.
+ *
+ * When an application binds a parameter with an explicit SQL type via
+ * SQLBindParameter (e.g. SQL_SMALLINT), the driver appends this suffix to the
+ * corresponding "$N" marker so PostgreSQL interprets the value as that type
+ * rather than as an untyped string literal. This makes comparisons behave
+ * numerically and produces type-accurate server error messages, matching the
+ * original psqlodbc's sqltype_to_pgcast() behavior.
+ *
+ * SQL_CHAR/SQL_VARCHAR intentionally return NULL: leaving them untyped lets
+ * PostgreSQL treat the value as text, which is what applications expect for
+ * character parameters.
+ */
+const char *type_mapping_get_param_cast(SQLSMALLINT sql_type);
 
 #endif /* PSQLODBC2_TYPE_MAPPING_H */

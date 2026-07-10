@@ -21,7 +21,9 @@
 #include "column_binding.h"
 #include "results.h"
 #include "catalog.h"
+#include "type_mapping.h"
 #include "error_mapping.h"
+#include "query_parser.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -401,20 +403,72 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         return SQL_ERROR;
     }
 
+    /* List of ODBC function IDs this driver supports */
+    static const SQLUSMALLINT supported_functions[] = {
+        SQL_API_SQLALLOCHANDLE,
+        SQL_API_SQLFREEHANDLE,
+        SQL_API_SQLCONNECT,
+        SQL_API_SQLDISCONNECT,
+        SQL_API_SQLDRIVERCONNECT,
+        SQL_API_SQLGETFUNCTIONS,
+        SQL_API_SQLGETDIAGREC,
+        SQL_API_SQLGETDIAGFIELD,
+        SQL_API_SQLPREPARE,
+        SQL_API_SQLEXECUTE,
+        SQL_API_SQLEXECDIRECT,
+        SQL_API_SQLFREESTMT,
+        SQL_API_SQLNUMRESULTCOLS,
+        SQL_API_SQLDESCRIBECOL,
+        SQL_API_SQLROWCOUNT,
+        SQL_API_SQLFETCH,
+        SQL_API_SQLGETDATA,
+        SQL_API_SQLBINDCOL,
+        SQL_API_SQLBINDPARAMETER,
+        SQL_API_SQLTABLES,
+        SQL_API_SQLCOLUMNS,
+        SQL_API_SQLPRIMARYKEYS,
+        SQL_API_SQLFOREIGNKEYS,
+        SQL_API_SQLSETCONNECTATTR,
+        SQL_API_SQLGETCONNECTATTR,
+        SQL_API_SQLSETENVATTR,
+        SQL_API_SQLGETENVATTR,
+        SQL_API_SQLSETSTMTATTR,
+        SQL_API_SQLGETSTMTATTR,
+        SQL_API_SQLENDTRAN,
+        SQL_API_SQLDESCRIBEPARAM,
+        SQL_API_SQLCOLATTRIBUTE,
+        SQL_API_SQLGETINFO,
+        SQL_API_SQLNUMPARAMS,
+        SQL_API_SQLNATIVESQL,
+    };
+    int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
+
     if (function_id == SQL_API_ODBC3_ALL_FUNCTIONS) {
-        /* ODBC 3.x bitmap array: 4000 bits = 250 SQLUSMALLINT entries.
-         * Set everything to zero (no functions supported yet). */
-        for (int index = 0; index < SQL_API_ODBC3_ALL_FUNCTIONS_SIZE; index++) {
-            supported_flags[index] = 0;
+        /* ODBC 3.x bitmap: zero everything then set supported bits */
+        memset(supported_flags, 0, SQL_API_ODBC3_ALL_FUNCTIONS_SIZE * sizeof(SQLUSMALLINT));
+        for (int i = 0; i < num_supported; i++) {
+            SQLUSMALLINT fid = supported_functions[i];
+            supported_flags[fid >> 4] |= (1 << (fid & 0x000F));
         }
     } else if (function_id == SQL_API_ALL_FUNCTIONS) {
-        /* ODBC 2.x array: fixed-size array per the ODBC specification */
+        /* ODBC 2.x array: set all to FALSE, then mark supported ones */
         for (int index = 0; index < ODBC2_ALL_FUNCTIONS_ARRAY_SIZE; index++) {
             supported_flags[index] = SQL_FALSE;
         }
+        for (int i = 0; i < num_supported; i++) {
+            if (supported_functions[i] < ODBC2_ALL_FUNCTIONS_ARRAY_SIZE) {
+                supported_flags[supported_functions[i]] = SQL_TRUE;
+            }
+        }
     } else {
-        /* Single function query — report not supported */
+        /* Single function query */
         *supported_flags = SQL_FALSE;
+        for (int i = 0; i < num_supported; i++) {
+            if (supported_functions[i] == function_id) {
+                *supported_flags = SQL_TRUE;
+                break;
+            }
+        }
     }
 
     return SQL_SUCCESS;
@@ -467,12 +521,15 @@ SQLDriverConnect(SQLHDBC       connection_handle,
 
     diagnostics_clear(&connection->diagnostics);
 
-    /* Only SQL_DRIVER_NOPROMPT is supported — we have no GUI for prompting */
-    if (driver_completion != SQL_DRIVER_NOPROMPT) {
+    /* SQL_DRIVER_PROMPT requires a GUI dialog — not supported.
+     * SQL_DRIVER_COMPLETE and SQL_DRIVER_COMPLETE_REQUIRED only prompt when
+     * required parameters are missing; with no GUI, we proceed without prompting
+     * (same behavior as the original psqlodbc on non-Windows platforms). */
+    if (driver_completion == SQL_DRIVER_PROMPT && window_handle != NULL) {
         diagnostics_add_record(&connection->diagnostics,
                                "HYC00",  /* Optional feature not implemented */
                                0,
-                               "Only SQL_DRIVER_NOPROMPT is supported. Dialog-based completion is not implemented.");
+                               "SQL_DRIVER_PROMPT is not supported (no GUI dialog available).");
         return SQL_ERROR;
     }
 
@@ -1353,6 +1410,123 @@ SQLBindParameter(SQLHSTMT      statement_handle,
 }
 
 /**
+ * SQLDescribeParam — Describe a parameter marker in a prepared statement.
+ *
+ * Returns the SQL data type, size, decimal digits, and nullability of the
+ * specified parameter marker. Requires the statement to have been prepared
+ * via SQLPrepare so that PostgreSQL has inferred the parameter types.
+ *
+ * Parameters:
+ *   statement_handle  - A valid prepared statement handle.
+ *   parameter_number  - The parameter position (1-based).
+ *   data_type_ptr     - Output: the SQL data type of the parameter.
+ *   parameter_size_ptr - Output: the size (precision) of the parameter.
+ *   decimal_digits_ptr - Output: the decimal digits (scale) of the parameter.
+ *   nullable_ptr      - Output: whether the parameter allows NULLs.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Parameter described successfully.
+ *   SQL_ERROR          - Statement not prepared or parameter out of range.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqldescribeparam-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLDescribeParam(SQLHSTMT      statement_handle,
+                 SQLUSMALLINT  parameter_number,
+                 SQLSMALLINT  *data_type_ptr,
+                 SQLULEN      *parameter_size_ptr,
+                 SQLSMALLINT  *decimal_digits_ptr,
+                 SQLSMALLINT  *nullable_ptr)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    if (!statement->is_prepared) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY010",  /* Function sequence error */
+                               0,
+                               "SQLDescribeParam requires a prepared statement.");
+        return SQL_ERROR;
+    }
+
+    if (parameter_number < 1 || parameter_number > (SQLUSMALLINT)statement->detected_param_count) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "07009",  /* Invalid descriptor index */
+                               0,
+                               "Parameter number is out of range.");
+        return SQL_ERROR;
+    }
+
+    /* Use PQdescribePrepared result to get parameter type info.
+     * PQparamtype returns the OID of the inferred parameter type. */
+    if (!statement->parent_connection || !statement->parent_connection->libpq_connection) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "08003", 0,
+                               "Connection is not active.");
+        return SQL_ERROR;
+    }
+
+    /* Get the parameter type OID from a fresh PQdescribePrepared call,
+     * or use the describe_result we already have. */
+    PGconn *libpq_conn = statement->parent_connection->libpq_connection;
+    PGresult *param_desc = PQdescribePrepared(libpq_conn, statement->prepared_name);
+    if (!param_desc || PQresultStatus(param_desc) != PGRES_COMMAND_OK) {
+        if (param_desc) PQclear(param_desc);
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY000", 0,
+                               "PQdescribePrepared failed for parameter description.");
+        return SQL_ERROR;
+    }
+
+    int param_count = PQnparams(param_desc);
+    if ((int)parameter_number > param_count) {
+        PQclear(param_desc);
+        diagnostics_add_record(&statement->diagnostics,
+                               "07009", 0,
+                               "Parameter number exceeds the number of parameters in the statement.");
+        return SQL_ERROR;
+    }
+
+    /* PQparamtype uses 0-based index */
+    Oid param_oid = PQparamtype(param_desc, (int)(parameter_number - 1));
+    PQclear(param_desc);
+
+    /* Map PostgreSQL OID to ODBC SQL type */
+    if (data_type_ptr) {
+        *data_type_ptr = type_mapping_get_sql_type(param_oid);
+    }
+
+    if (parameter_size_ptr) {
+        *parameter_size_ptr = type_mapping_get_column_size(param_oid, -1);
+    }
+
+    if (decimal_digits_ptr) {
+        /* For integer types, return -1 to indicate "not applicable" rather than
+         * 0 (which would imply exact zero decimal places). This matches the
+         * behavior of the original psqlodbc driver. */
+        SQLSMALLINT digits = type_mapping_get_decimal_digits(param_oid, -1);
+        SQLSMALLINT sql_type = type_mapping_get_sql_type(param_oid);
+        if (sql_type == SQL_INTEGER || sql_type == SQL_SMALLINT || sql_type == SQL_BIGINT) {
+            digits = -1;
+        }
+        *decimal_digits_ptr = digits;
+    }
+
+    /* Parameters are always nullable from the driver's perspective */
+    if (nullable_ptr) {
+        *nullable_ptr = SQL_NULLABLE;
+    }
+
+    return SQL_SUCCESS;
+}
+
+/**
  * SQLBindCol — Bind a result set column to an application variable.
  *
  * After binding, SQLFetch will automatically write the column's value into
@@ -1468,15 +1642,22 @@ SQLSetConnectAttr(SQLHDBC     connection_handle,
     case SQL_ATTR_AUTOCOMMIT: {
         bool new_autocommit = (value_as_uint == SQL_AUTOCOMMIT_ON);
 
-        /* If switching from OFF to ON, commit any active transaction.
-         * This matches the ODBC spec: "If an application sets SQL_ATTR_AUTOCOMMIT
-         * to SQL_AUTOCOMMIT_ON... any open transaction on the connection is committed." */
+        /* If switching from OFF to ON, end any active transaction.
+         * If the transaction is in FAILED state (an error occurred), we must
+         * ROLLBACK since PostgreSQL rejects COMMIT in an aborted transaction.
+         * Otherwise, COMMIT per the ODBC spec: "If an application sets
+         * SQL_ATTR_AUTOCOMMIT to SQL_AUTOCOMMIT_ON... any open transaction
+         * on the connection is committed." */
         if (new_autocommit && !connection->autocommit) {
             if (connection->transaction_state != TRANSACTION_STATE_IDLE &&
                 connection->state == CONNECTION_STATE_CONNECTED) {
-                SQLRETURN commit_result = connection_commit(connection);
-                if (commit_result != SQL_SUCCESS) {
-                    return commit_result;
+                if (connection->transaction_state == TRANSACTION_STATE_FAILED) {
+                    connection_rollback(connection);
+                } else {
+                    SQLRETURN commit_result = connection_commit(connection);
+                    if (commit_result != SQL_SUCCESS) {
+                        return commit_result;
+                    }
                 }
             }
         }
@@ -2078,4 +2259,1141 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
                                "Unsupported statement attribute.");
         return SQL_ERROR;
     }
+}
+
+/**
+ * SQLSetEnvAttr — Set an environment attribute.
+ *
+ * The most critical attribute is SQL_ATTR_ODBC_VERSION which must be set
+ * before allocating connection handles.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetenvattr-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSetEnvAttr(SQLHENV     environment_handle,
+              SQLINTEGER  attribute,
+              SQLPOINTER  value_ptr,
+              SQLINTEGER  string_length)
+{
+    (void)string_length;
+
+    OdbcEnvironment *environment = (OdbcEnvironment *)environment_handle;
+
+    if (!environment || environment->magic_number != ENVIRONMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    switch (attribute) {
+    case SQL_ATTR_ODBC_VERSION:
+        environment->odbc_version = (int)(intptr_t)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_CONNECTION_POOLING:
+    case SQL_ATTR_CP_MATCH:
+    case SQL_ATTR_OUTPUT_NTS:
+        return SQL_SUCCESS;
+
+    default:
+        diagnostics_add_record(&environment->diagnostics,
+                               "HY092", 0,
+                               "Invalid or unsupported environment attribute.");
+        return SQL_ERROR;
+    }
+}
+
+/**
+ * SQLGetEnvAttr — Get an environment attribute value.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetenvattr-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetEnvAttr(SQLHENV     environment_handle,
+              SQLINTEGER  attribute,
+              SQLPOINTER  value_ptr,
+              SQLINTEGER  buffer_length,
+              SQLINTEGER *string_length_ptr)
+{
+    (void)buffer_length;
+    (void)string_length_ptr;
+
+    OdbcEnvironment *environment = (OdbcEnvironment *)environment_handle;
+
+    if (!environment || environment->magic_number != ENVIRONMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    switch (attribute) {
+    case SQL_ATTR_ODBC_VERSION:
+        if (value_ptr) {
+            *(SQLINTEGER *)value_ptr = (SQLINTEGER)environment->odbc_version;
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_CONNECTION_POOLING:
+        if (value_ptr) {
+            *(SQLUINTEGER *)value_ptr = SQL_CP_OFF;
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_OUTPUT_NTS:
+        if (value_ptr) {
+            *(SQLUINTEGER *)value_ptr = SQL_TRUE;
+        }
+        return SQL_SUCCESS;
+
+    default:
+        diagnostics_add_record(&environment->diagnostics,
+                               "HY092", 0,
+                               "Invalid or unsupported environment attribute.");
+        return SQL_ERROR;
+    }
+}
+
+/* PostgreSQL encodes an interval's field set (YEAR, MONTH, DAY ... SECOND) in
+ * the high bits of its type modifier. These bit positions match the server's
+ * INTERVAL_MASK definitions and let us report the precise "interval <fields>"
+ * type name that the application expects. */
+#define INTERVAL_MONTH_BIT  (1 << 17)
+#define INTERVAL_YEAR_BIT   (1 << 18)
+#define INTERVAL_DAY_BIT    (1 << 19)
+#define INTERVAL_HOUR_BIT   (1 << 26)
+#define INTERVAL_MINUTE_BIT (1 << 27)
+#define INTERVAL_SECOND_BIT (1 << 28)
+
+/*
+ * Map a PostgreSQL interval type modifier to its SQL type-name string
+ * (e.g. "interval day to second"). Returns the generic "interval" when the
+ * modifier does not restrict the field set (typmod -1) or is unrecognized.
+ */
+static const char *interval_type_name(int type_modifier)
+{
+    if (type_modifier == -1) {
+        return "interval";
+    }
+    if (type_modifier & INTERVAL_YEAR_BIT) {
+        return (type_modifier & INTERVAL_MONTH_BIT) ? "interval year to month"
+                                                    : "interval year";
+    }
+    if (type_modifier & INTERVAL_MONTH_BIT) {
+        return "interval month";
+    }
+    if (type_modifier & INTERVAL_DAY_BIT) {
+        if (type_modifier & INTERVAL_SECOND_BIT) { return "interval day to second"; }
+        if (type_modifier & INTERVAL_MINUTE_BIT) { return "interval day to minute"; }
+        if (type_modifier & INTERVAL_HOUR_BIT)   { return "interval day to hour"; }
+        return "interval day";
+    }
+    if (type_modifier & INTERVAL_HOUR_BIT) {
+        if (type_modifier & INTERVAL_SECOND_BIT) { return "interval hour to second"; }
+        if (type_modifier & INTERVAL_MINUTE_BIT) { return "interval hour to minute"; }
+        return "interval hour";
+    }
+    if (type_modifier & INTERVAL_MINUTE_BIT) {
+        return (type_modifier & INTERVAL_SECOND_BIT) ? "interval minute to second"
+                                                     : "interval minute";
+    }
+    if (type_modifier & INTERVAL_SECOND_BIT) {
+        return "interval second";
+    }
+    return "interval";
+}
+
+/*
+ * Scan the fetched rows of a result column and return the maximum value length
+ * in characters. Used for UnknownSizes=LONGEST reporting. Returns 0 when there
+ * are no rows or the column is entirely NULL.
+ *
+ * Note: this reports byte length from libpq; for the octet-length computation
+ * that is exactly what we want, and for character counts it is an upper bound.
+ */
+static int longest_value_length(PGresult *result, int column_index)
+{
+    if (!result) {
+        return 0;
+    }
+    int longest = 0;
+    int row_count = PQntuples(result);
+    for (int row = 0; row < row_count; row++) {
+        if (PQgetisnull(result, row, column_index)) {
+            continue;
+        }
+        int length = PQgetlength(result, row, column_index);
+        if (length > longest) {
+            longest = length;
+        }
+    }
+    return longest;
+}
+
+/*
+ * Compute the column size, in characters, for a character/unbounded type,
+ * honoring the connection's UnknownSizes setting. This mirrors the original
+ * psqlodbc getCharColumnSizeX() logic:
+ *   - A declared length (typmod > 0) is always used as-is.
+ *   - Otherwise the value depends on UnknownSizes: MAX reports the configured
+ *     maximum for the type; LONGEST reports the longest value in the result;
+ *     DONTKNOW reports "unknown" (returns -1).
+ */
+static int char_column_size_chars(unsigned int postgres_oid, int type_modifier,
+                                   const OdbcConnection *connection,
+                                   PGresult *result, int column_index)
+{
+    /* varchar(n)/char(n) declare their limit in the type modifier. */
+    if (type_modifier > 4 &&
+        (postgres_oid == PG_TYPE_VARCHAR || postgres_oid == PG_TYPE_BPCHAR)) {
+        return type_modifier - 4;
+    }
+
+    int unknown_sizes = connection ? connection->info.unknown_sizes : UNKNOWN_SIZES_MAX;
+    int max_varchar = connection ? connection->info.max_varchar_size
+                                 : DEFAULT_MAX_VARCHAR_SIZE;
+
+    /* text/longvarchar use the larger long-varchar limit; varchar/char use the
+     * varchar limit. (text_as_longvarchar is on by default in the original.) */
+    int max_size = (postgres_oid == PG_TYPE_TEXT) ? DEFAULT_MAX_LONGVARCHAR_SIZE
+                                                   : max_varchar;
+
+    /* Only LONGEST changes the reported octet length; both MAX and DONTKNOW
+     * report the configured maximum size for the type (matching the original
+     * driver's observed octet-length behavior). */
+    if (unknown_sizes == UNKNOWN_SIZES_LONGEST) {
+        int longest = longest_value_length(result, column_index);
+        if (longest > 0) {
+            return longest;
+        }
+        /* No data to measure — fall back to the maximum size. */
+    }
+    return max_size;
+}
+
+/*
+ * Compute SQL_DESC_OCTET_LENGTH (maximum byte size) for a column, mirroring the
+ * original psqlodbc pgtype_attr_transfer_octet_length():
+ *   - Fixed-width types (integers, floats, dates, interval, etc.) transfer as
+ *     their native binary/text form and report octet length 0.
+ *   - Character types report coef * column_size, where coef is the client
+ *     encoding's max bytes per character, capped so a value that fits in
+ *     max_varchar characters is not inflated past max_varchar bytes.
+ */
+static SQLLEN compute_octet_length(unsigned int postgres_oid, int type_modifier,
+                                   const OdbcConnection *connection,
+                                   PGresult *result, int column_index)
+{
+    switch (postgres_oid) {
+    case PG_TYPE_VARCHAR:
+    case PG_TYPE_BPCHAR:
+    case PG_TYPE_TEXT: {
+        int column_size = char_column_size_chars(postgres_oid, type_modifier,
+                                                  connection, result, column_index);
+        if (column_size < 0) {
+            return 0;  /* size unknown */
+        }
+        int coef = connection ? connection->max_bytes_per_char : 1;
+        if (coef <= 1) {
+            return column_size;
+        }
+        int max_varchar = connection ? connection->info.max_varchar_size
+                                     : DEFAULT_MAX_VARCHAR_SIZE;
+        /* Don't inflate a value that already fits in max_varchar characters
+         * beyond max_varchar bytes — matches the original's cap. */
+        if (column_size <= max_varchar && column_size * coef > max_varchar) {
+            return max_varchar;
+        }
+        return (SQLLEN)coef * column_size;
+    }
+    case PG_TYPE_BYTEA:
+        /* bytea has no fixed maximum; report unknown. */
+        return 0;
+    default:
+        /* Fixed-width and date/time/interval types transfer without a byte cap. */
+        return 0;
+    }
+}
+
+/**
+ * SQLColAttribute — Retrieve a column attribute from the result set metadata.
+ *
+ * Returns descriptor information (name, type, display size, nullability, etc.)
+ * for a specific column in the result set. String attributes are written to
+ * character_attribute; numeric attributes are written to numeric_attribute.
+ *
+ * Parameters:
+ *   statement_handle    - A valid statement handle with an available result set.
+ *   column_number       - The column to describe (1-based).
+ *   field_identifier    - Which attribute to retrieve (SQL_DESC_NAME, SQL_DESC_TYPE, etc.).
+ *   character_attribute - Output buffer for string-valued attributes.
+ *   buffer_length       - Size of character_attribute buffer in bytes.
+ *   string_length       - Output: actual length of string data (excluding null terminator).
+ *   numeric_attribute   - Output: value for numeric-valued attributes.
+ *
+ * Returns:
+ *   SQL_SUCCESS           - Attribute retrieved successfully.
+ *   SQL_SUCCESS_WITH_INFO - String attribute was truncated.
+ *   SQL_ERROR             - No result set, invalid column, or invalid field identifier.
+ *   SQL_INVALID_HANDLE    - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlcolattribute-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLColAttribute(SQLHSTMT     statement_handle,
+                SQLUSMALLINT column_number,
+                SQLUSMALLINT field_identifier,
+                SQLPOINTER   character_attribute,
+                SQLSMALLINT  buffer_length,
+                SQLSMALLINT *string_length,
+                SQLLEN      *numeric_attribute)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    /* Use the execution result if available, otherwise fall back to
+     * the describe_result from PQdescribePrepared (pre-execute metadata). */
+    PGresult *metadata_source = statement->current_result;
+    if (!metadata_source) {
+        metadata_source = statement->describe_result;
+    }
+
+    if (!metadata_source) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY010",  /* Function sequence error */
+                               0,
+                               "No result set available for SQLColAttribute.");
+        return SQL_ERROR;
+    }
+
+    int total_columns = PQnfields(metadata_source);
+
+    /* SQL_DESC_COUNT is special — it doesn't require a valid column_number */
+    if (field_identifier == SQL_DESC_COUNT) {
+        if (numeric_attribute) {
+            *numeric_attribute = (SQLLEN)total_columns;
+        }
+        return SQL_SUCCESS;
+    }
+
+    /* Validate column number (1-based) */
+    if (column_number < 1 || column_number > (SQLUSMALLINT)total_columns) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "07009",  /* Invalid descriptor index */
+                               0,
+                               "Column number is out of range in SQLColAttribute.");
+        return SQL_ERROR;
+    }
+
+    int column_index = (int)(column_number - 1);  /* libpq uses 0-based */
+    unsigned int postgres_oid = (unsigned int)PQftype(metadata_source, column_index);
+    int type_modifier = PQfmod(metadata_source, column_index);
+
+    /* --- Dispatch on field_identifier --- */
+
+    switch (field_identifier) {
+    /* --- String attributes --- */
+    case SQL_DESC_LABEL:
+    case SQL_DESC_NAME:
+    case SQL_COLUMN_NAME: { /* ODBC 2.x compatibility alias */
+        const char *col_name = PQfname(metadata_source, column_index);
+        SQLSMALLINT name_len = (SQLSMALLINT)strlen(col_name);
+        if (string_length) { *string_length = name_len; }
+        if (character_attribute && buffer_length > 0) {
+            SQLSMALLINT copy_len = (name_len < buffer_length) ? name_len : (buffer_length - 1);
+            memcpy(character_attribute, col_name, (size_t)copy_len);
+            ((char *)character_attribute)[copy_len] = '\0';
+            if (name_len >= buffer_length) {
+                diagnostics_add_record(&statement->diagnostics,
+                                       "01004", 0,
+                                       "String data truncated in SQLColAttribute.");
+                return SQL_SUCCESS_WITH_INFO;
+            }
+        }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_TYPE_NAME: {
+        /* Interval reports a field-set-specific name (e.g. "interval day to
+         * second") decoded from its type modifier. */
+        const char *type_name = (postgres_oid == PG_TYPE_INTERVAL)
+                                    ? interval_type_name(type_modifier)
+                                    : type_mapping_get_type_name(postgres_oid);
+        SQLSMALLINT name_len = (SQLSMALLINT)strlen(type_name);
+        if (string_length) { *string_length = name_len; }
+        if (character_attribute && buffer_length > 0) {
+            SQLSMALLINT copy_len = (name_len < buffer_length) ? name_len : (buffer_length - 1);
+            memcpy(character_attribute, type_name, (size_t)copy_len);
+            ((char *)character_attribute)[copy_len] = '\0';
+            if (name_len >= buffer_length) {
+                diagnostics_add_record(&statement->diagnostics,
+                                       "01004", 0,
+                                       "String data truncated in SQLColAttribute.");
+                return SQL_SUCCESS_WITH_INFO;
+            }
+        }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_TABLE_NAME:
+    case SQL_DESC_SCHEMA_NAME:
+    case SQL_DESC_CATALOG_NAME:
+    case SQL_DESC_LOCAL_TYPE_NAME: {
+        /* These would require expensive pg_attribute lookups; return empty */
+        if (string_length) { *string_length = 0; }
+        if (character_attribute && buffer_length > 0) {
+            ((char *)character_attribute)[0] = '\0';
+        }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_LITERAL_PREFIX:
+    case SQL_DESC_LITERAL_SUFFIX: {
+        /* String types use quote delimiters; numeric types use none */
+        SQLSMALLINT sql_type = type_mapping_get_sql_type(postgres_oid);
+        const char *literal = "";
+        if (sql_type == SQL_CHAR || sql_type == SQL_VARCHAR ||
+            sql_type == SQL_LONGVARCHAR || sql_type == SQL_TYPE_DATE ||
+            sql_type == SQL_TYPE_TIME || sql_type == SQL_TYPE_TIMESTAMP) {
+            literal = "'";
+        }
+        SQLSMALLINT lit_len = (SQLSMALLINT)strlen(literal);
+        if (string_length) { *string_length = lit_len; }
+        if (character_attribute && buffer_length > 0) {
+            SQLSMALLINT copy_len = (lit_len < buffer_length) ? lit_len : (buffer_length - 1);
+            memcpy(character_attribute, literal, (size_t)copy_len);
+            ((char *)character_attribute)[copy_len] = '\0';
+        }
+        return SQL_SUCCESS;
+    }
+
+    /* --- Numeric attributes --- */
+    case SQL_DESC_TYPE:
+    case SQL_DESC_CONCISE_TYPE:
+        if (numeric_attribute) {
+            *numeric_attribute = (SQLLEN)type_mapping_get_sql_type(postgres_oid);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_DISPLAY_SIZE: {
+        SQLULEN col_size = type_mapping_get_column_size(postgres_oid, type_modifier);
+        /* For variable-length types with no declared limit, use a sensible default */
+        if (col_size == 0) { col_size = 255; }
+        if (numeric_attribute) { *numeric_attribute = (SQLLEN)col_size; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_OCTET_LENGTH: {
+        if (numeric_attribute) {
+            *numeric_attribute = compute_octet_length(postgres_oid, type_modifier,
+                                                      statement->parent_connection,
+                                                      statement->current_result,
+                                                      column_index);
+        }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_LENGTH: {
+        SQLULEN col_size = type_mapping_get_column_size(postgres_oid, type_modifier);
+        if (col_size == 0) { col_size = 255; }
+        if (numeric_attribute) { *numeric_attribute = (SQLLEN)col_size; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_PRECISION:
+    case SQL_COLUMN_PRECISION: {
+        SQLULEN col_size = type_mapping_get_column_size(postgres_oid, type_modifier);
+        if (col_size == 0) { col_size = 255; }
+        if (numeric_attribute) { *numeric_attribute = (SQLLEN)col_size; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_SCALE:
+    case SQL_COLUMN_SCALE:
+        if (numeric_attribute) {
+            *numeric_attribute = (SQLLEN)type_mapping_get_decimal_digits(postgres_oid, type_modifier);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_NULLABLE:
+    case SQL_COLUMN_NULLABLE:
+        if (numeric_attribute) { *numeric_attribute = SQL_NULLABLE_UNKNOWN; }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_UNSIGNED: {
+        /* Numeric types in PostgreSQL are all signed */
+        SQLSMALLINT sql_type = type_mapping_get_sql_type(postgres_oid);
+        int is_unsigned = SQL_FALSE;
+        if (sql_type == SQL_CHAR || sql_type == SQL_VARCHAR ||
+            sql_type == SQL_LONGVARCHAR || sql_type == SQL_TYPE_DATE ||
+            sql_type == SQL_TYPE_TIME || sql_type == SQL_TYPE_TIMESTAMP ||
+            sql_type == SQL_LONGVARBINARY || sql_type == SQL_GUID) {
+            /* Non-numeric types: the "unsigned" concept doesn't apply, but
+             * ODBC convention is to return SQL_TRUE for non-applicable types */
+            is_unsigned = SQL_TRUE;
+        }
+        if (numeric_attribute) { *numeric_attribute = is_unsigned; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_AUTO_UNIQUE_VALUE:
+        if (numeric_attribute) { *numeric_attribute = SQL_FALSE; }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_UPDATABLE:
+        if (numeric_attribute) { *numeric_attribute = SQL_ATTR_READWRITE_UNKNOWN; }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_SEARCHABLE:
+        if (numeric_attribute) { *numeric_attribute = SQL_PRED_SEARCHABLE; }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_CASE_SENSITIVE: {
+        SQLSMALLINT sql_type = type_mapping_get_sql_type(postgres_oid);
+        int is_case_sensitive = SQL_FALSE;
+        if (sql_type == SQL_CHAR || sql_type == SQL_VARCHAR ||
+            sql_type == SQL_LONGVARCHAR) {
+            is_case_sensitive = SQL_TRUE;
+        }
+        if (numeric_attribute) { *numeric_attribute = is_case_sensitive; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_FIXED_PREC_SCALE:
+        if (numeric_attribute) { *numeric_attribute = SQL_FALSE; }
+        return SQL_SUCCESS;
+
+    case SQL_DESC_NUM_PREC_RADIX: {
+        SQLSMALLINT sql_type = type_mapping_get_sql_type(postgres_oid);
+        int radix = 0;
+        if (sql_type == SQL_SMALLINT || sql_type == SQL_INTEGER ||
+            sql_type == SQL_BIGINT || sql_type == SQL_REAL ||
+            sql_type == SQL_DOUBLE || sql_type == SQL_NUMERIC) {
+            radix = 10;
+        }
+        if (numeric_attribute) { *numeric_attribute = radix; }
+        return SQL_SUCCESS;
+    }
+
+    case SQL_DESC_COUNT:
+        if (numeric_attribute) { *numeric_attribute = (SQLLEN)total_columns; }
+        return SQL_SUCCESS;
+
+    default:
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY091",  /* Invalid descriptor field identifier */
+                               0,
+                               "Unsupported field identifier in SQLColAttribute.");
+        return SQL_ERROR;
+    }
+}
+
+/**
+ * SQLGetInfo — Return general information about the driver and data source.
+ *
+ * Applications and the Driver Manager call this to determine driver capabilities,
+ * data source characteristics, and supported SQL grammar. Different info_type
+ * values return either a string (copied to info_value with length in string_length)
+ * or an integer (written as SQLUINTEGER/SQLUSMALLINT to info_value).
+ *
+ * Parameters:
+ *   connection_handle - A valid connection handle.
+ *   info_type         - The information type requested (SQL_DBMS_NAME, SQL_DRIVER_VER, etc.).
+ *   info_value        - Output buffer for the requested information.
+ *   buffer_length     - Size of info_value buffer in bytes (for string types).
+ *   string_length     - Output: actual byte length of string data (for string types).
+ *
+ * Returns:
+ *   SQL_SUCCESS           - Information retrieved successfully.
+ *   SQL_SUCCESS_WITH_INFO - String data was truncated.
+ *   SQL_ERROR             - Invalid info_type or other error.
+ *   SQL_INVALID_HANDLE    - connection_handle is not a valid connection handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetinfo-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetInfo(SQLHDBC      connection_handle,
+           SQLUSMALLINT info_type,
+           SQLPOINTER   info_value,
+           SQLSMALLINT  buffer_length,
+           SQLSMALLINT *string_length)
+{
+    OdbcConnection *connection = (OdbcConnection *)connection_handle;
+
+    if (!connection || connection->magic_number != CONNECTION_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&connection->diagnostics);
+
+    /* Internal helper: copy a string to the info_value buffer and report length */
+    #define GETINFO_RETURN_STRING(str) do { \
+        const char *_s = (str) ? (str) : ""; \
+        SQLSMALLINT _len = (SQLSMALLINT)strlen(_s); \
+        if (string_length) { *string_length = _len; } \
+        if (info_value && buffer_length > 0) { \
+            SQLSMALLINT _copy = (_len < buffer_length) ? _len : (buffer_length - 1); \
+            memcpy(info_value, _s, (size_t)_copy); \
+            ((char *)info_value)[_copy] = '\0'; \
+            if (_len >= buffer_length) { \
+                diagnostics_add_record(&connection->diagnostics, \
+                                       "01004", 0, \
+                                       "String data truncated in SQLGetInfo."); \
+                return SQL_SUCCESS_WITH_INFO; \
+            } \
+        } \
+        return SQL_SUCCESS; \
+    } while (0)
+
+    #define GETINFO_RETURN_UINT(val) do { \
+        if (info_value) { *(SQLUINTEGER *)info_value = (SQLUINTEGER)(val); } \
+        if (string_length) { *string_length = (SQLSMALLINT)sizeof(SQLUINTEGER); } \
+        return SQL_SUCCESS; \
+    } while (0)
+
+    #define GETINFO_RETURN_USHORT(val) do { \
+        if (info_value) { *(SQLUSMALLINT *)info_value = (SQLUSMALLINT)(val); } \
+        if (string_length) { *string_length = (SQLSMALLINT)sizeof(SQLUSMALLINT); } \
+        return SQL_SUCCESS; \
+    } while (0)
+
+    switch (info_type) {
+    /* --- String info types --- */
+    case SQL_DBMS_NAME:
+        GETINFO_RETURN_STRING("PostgreSQL");
+
+    case SQL_DBMS_VER: {
+        /* Format: "MM.mm.pppp" from PQserverVersion.
+         * PG >= 10: version = major*10000 + revision (e.g. 180004 = 18.4)
+         *   → format as "major.revision.0" so ODBC sees "18.04.0000"
+         * PG < 10: version = major*10000 + minor*100 + patch (e.g. 90608 = 9.6.8)
+         *   → format as "major.minor.patch" so ODBC sees "09.06.0008" */
+        char version_buffer[32];
+        int server_ver = 0;
+        if (connection->libpq_connection) {
+            server_ver = PQserverVersion(connection->libpq_connection);
+        }
+        int major = server_ver / 10000;
+        if (major >= 10) {
+            int revision = server_ver % 10000;
+            snprintf(version_buffer, sizeof(version_buffer),
+                     "%02d.%02d.%04d", major, revision, 0);
+        } else {
+            int minor = (server_ver / 100) % 100;
+            int patch = server_ver % 100;
+            snprintf(version_buffer, sizeof(version_buffer),
+                     "%02d.%02d.%04d", major, minor, patch);
+        }
+        GETINFO_RETURN_STRING(version_buffer);
+    }
+
+    case SQL_DRIVER_NAME:
+        GETINFO_RETURN_STRING("psqlodbc2w");
+
+    case SQL_DRIVER_VER:
+        GETINFO_RETURN_STRING("00.01.0000");
+
+    case SQL_DRIVER_ODBC_VER:
+        GETINFO_RETURN_STRING("03.80");
+
+    case SQL_IDENTIFIER_QUOTE_CHAR:
+        GETINFO_RETURN_STRING("\"");
+
+    case SQL_CATALOG_NAME_SEPARATOR:
+        GETINFO_RETURN_STRING(".");
+
+    case SQL_CATALOG_TERM:
+        GETINFO_RETURN_STRING("database");
+
+    case SQL_SCHEMA_TERM:
+        GETINFO_RETURN_STRING("schema");
+
+    case SQL_TABLE_TERM:
+        GETINFO_RETURN_STRING("table");
+
+    case SQL_PROCEDURE_TERM:
+        GETINFO_RETURN_STRING("function");
+
+    case SQL_SEARCH_PATTERN_ESCAPE:
+        GETINFO_RETURN_STRING("\\");
+
+    case SQL_DATA_SOURCE_NAME:
+        GETINFO_RETURN_STRING("");
+
+    case SQL_SERVER_NAME:
+        if (connection->libpq_connection) {
+            GETINFO_RETURN_STRING(PQhost(connection->libpq_connection));
+        }
+        GETINFO_RETURN_STRING("");
+
+    case SQL_DATABASE_NAME:
+        if (connection->libpq_connection) {
+            GETINFO_RETURN_STRING(PQdb(connection->libpq_connection));
+        }
+        GETINFO_RETURN_STRING("");
+
+    case SQL_USER_NAME:
+        if (connection->libpq_connection) {
+            GETINFO_RETURN_STRING(PQuser(connection->libpq_connection));
+        }
+        GETINFO_RETURN_STRING("");
+
+    case SQL_COLUMN_ALIAS:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_KEYWORDS:
+        GETINFO_RETURN_STRING("");
+
+    case SQL_SPECIAL_CHARACTERS:
+        GETINFO_RETURN_STRING("");
+
+    case SQL_CATALOG_NAME:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_ORDER_BY_COLUMNS_IN_SELECT:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_INTEGRITY:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_ACCESSIBLE_TABLES:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_ACCESSIBLE_PROCEDURES:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_EXPRESSIONS_IN_ORDERBY:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_LIKE_ESCAPE_CLAUSE:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_MULT_RESULT_SETS:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_MULTIPLE_ACTIVE_TXN:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_OUTER_JOINS:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_PROCEDURES:
+        GETINFO_RETURN_STRING("Y");
+
+    case SQL_ROW_UPDATES:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_NEED_LONG_DATA_LEN:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_MAX_ROW_SIZE_INCLUDES_LONG:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_DATA_SOURCE_READ_ONLY:
+        GETINFO_RETURN_STRING("N");
+
+    case SQL_DESCRIBE_PARAMETER:
+        GETINFO_RETURN_STRING("Y");
+
+    /* --- Integer info types (SQLUSMALLINT) --- */
+    case SQL_MAX_IDENTIFIER_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_COLUMNS_IN_TABLE:
+        GETINFO_RETURN_USHORT(1600);
+
+    case SQL_MAX_CATALOG_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_SCHEMA_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_TABLE_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_COLUMN_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_CURSOR_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_PROCEDURE_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    case SQL_MAX_USER_NAME_LEN:
+        GETINFO_RETURN_USHORT(63);
+
+    /* --- Integer info types (SQLUINTEGER) --- */
+    case SQL_GETDATA_EXTENSIONS:
+        GETINFO_RETURN_UINT(SQL_GD_ANY_COLUMN | SQL_GD_ANY_ORDER);
+
+    case SQL_TXN_CAPABLE:
+        GETINFO_RETURN_USHORT(SQL_TC_ALL);
+
+    case SQL_CONCAT_NULL_BEHAVIOR:
+        GETINFO_RETURN_USHORT(SQL_CB_NULL);
+
+    case SQL_CURSOR_COMMIT_BEHAVIOR:
+        GETINFO_RETURN_USHORT(SQL_CB_CLOSE);
+
+    case SQL_CURSOR_ROLLBACK_BEHAVIOR:
+        GETINFO_RETURN_USHORT(SQL_CB_CLOSE);
+
+    case SQL_DEFAULT_TXN_ISOLATION:
+        GETINFO_RETURN_UINT(SQL_TXN_READ_COMMITTED);
+
+    case SQL_TXN_ISOLATION_OPTION:
+        GETINFO_RETURN_UINT(SQL_TXN_READ_COMMITTED | SQL_TXN_REPEATABLE_READ |
+                            SQL_TXN_SERIALIZABLE | SQL_TXN_READ_UNCOMMITTED);
+
+    case SQL_QUOTED_IDENTIFIER_CASE:
+        GETINFO_RETURN_USHORT(SQL_IC_SENSITIVE);
+
+    case SQL_NON_NULLABLE_COLUMNS:
+        GETINFO_RETURN_USHORT(SQL_NNC_NON_NULL);
+
+    case SQL_CORRELATION_NAME:
+        GETINFO_RETURN_USHORT(SQL_CN_ANY);
+
+    case SQL_GROUP_BY:
+        GETINFO_RETURN_USHORT(SQL_GB_GROUP_BY_EQUALS_SELECT);
+
+    case SQL_IDENTIFIER_CASE:
+        GETINFO_RETURN_USHORT(SQL_IC_LOWER);
+
+    case SQL_NULL_COLLATION:
+        GETINFO_RETURN_USHORT(SQL_NC_HIGH);
+
+    case SQL_CURSOR_SENSITIVITY:
+        GETINFO_RETURN_UINT(SQL_UNSPECIFIED);
+
+    case SQL_FILE_USAGE:
+        GETINFO_RETURN_USHORT(SQL_FILE_NOT_SUPPORTED);
+
+    case SQL_CATALOG_LOCATION:
+        GETINFO_RETURN_USHORT(SQL_CL_START);
+
+    case SQL_MAX_COLUMNS_IN_GROUP_BY:
+    case SQL_MAX_COLUMNS_IN_INDEX:
+    case SQL_MAX_COLUMNS_IN_ORDER_BY:
+    case SQL_MAX_COLUMNS_IN_SELECT:
+    case SQL_MAX_TABLES_IN_SELECT:
+        GETINFO_RETURN_USHORT(0);  /* No specific limit */
+
+    case SQL_MAX_INDEX_SIZE:
+    case SQL_MAX_ROW_SIZE:
+    case SQL_MAX_STATEMENT_LEN:
+    case SQL_MAX_CHAR_LITERAL_LEN:
+    case SQL_MAX_BINARY_LITERAL_LEN:
+        GETINFO_RETURN_UINT(0);  /* No specific limit */
+
+    case SQL_ACTIVE_ENVIRONMENTS:
+        GETINFO_RETURN_USHORT(0);  /* No limit */
+
+    case SQL_BOOKMARK_PERSISTENCE:
+        GETINFO_RETURN_UINT(0);  /* No bookmark support */
+
+    case SQL_DYNAMIC_CURSOR_ATTRIBUTES1:
+    case SQL_DYNAMIC_CURSOR_ATTRIBUTES2:
+    case SQL_KEYSET_CURSOR_ATTRIBUTES1:
+    case SQL_KEYSET_CURSOR_ATTRIBUTES2:
+        GETINFO_RETURN_UINT(0);
+
+    case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES1:
+        GETINFO_RETURN_UINT(SQL_CA1_NEXT);
+
+    case SQL_FORWARD_ONLY_CURSOR_ATTRIBUTES2:
+        GETINFO_RETURN_UINT(SQL_CA2_READ_ONLY_CONCURRENCY);
+
+    case SQL_STATIC_CURSOR_ATTRIBUTES1:
+        GETINFO_RETURN_UINT(SQL_CA1_NEXT);
+
+    case SQL_STATIC_CURSOR_ATTRIBUTES2:
+        GETINFO_RETURN_UINT(SQL_CA2_READ_ONLY_CONCURRENCY);
+
+    case SQL_SCROLL_OPTIONS:
+        GETINFO_RETURN_UINT(SQL_SO_FORWARD_ONLY);
+
+    case SQL_ALTER_TABLE:
+        GETINFO_RETURN_UINT(SQL_AT_ADD_COLUMN | SQL_AT_DROP_COLUMN);
+
+    case SQL_CREATE_TABLE:
+        GETINFO_RETURN_UINT(SQL_CT_CREATE_TABLE);
+
+    case SQL_DROP_TABLE:
+        GETINFO_RETURN_UINT(SQL_DT_DROP_TABLE);
+
+    case SQL_CREATE_VIEW:
+        GETINFO_RETURN_UINT(SQL_CV_CREATE_VIEW);
+
+    case SQL_DROP_VIEW:
+        GETINFO_RETURN_UINT(SQL_DV_DROP_VIEW);
+
+    case SQL_SUBQUERIES:
+        GETINFO_RETURN_UINT(SQL_SQ_CORRELATED_SUBQUERIES | SQL_SQ_COMPARISON |
+                            SQL_SQ_EXISTS | SQL_SQ_IN | SQL_SQ_QUANTIFIED);
+
+    case SQL_UNION:
+        GETINFO_RETURN_UINT(SQL_U_UNION | SQL_U_UNION_ALL);
+
+    case SQL_OJ_CAPABILITIES:
+        GETINFO_RETURN_UINT(SQL_OJ_LEFT | SQL_OJ_RIGHT | SQL_OJ_FULL |
+                            SQL_OJ_NESTED | SQL_OJ_NOT_ORDERED |
+                            SQL_OJ_INNER | SQL_OJ_ALL_COMPARISON_OPS);
+
+    case SQL_SQL_CONFORMANCE:
+        GETINFO_RETURN_UINT(SQL_SC_SQL92_ENTRY);
+
+    case SQL_ODBC_INTERFACE_CONFORMANCE:
+        GETINFO_RETURN_UINT(SQL_OIC_CORE);
+
+    case SQL_SQL92_PREDICATES:
+        GETINFO_RETURN_UINT(SQL_SP_EXISTS | SQL_SP_ISNOTNULL | SQL_SP_ISNULL |
+                            SQL_SP_LIKE | SQL_SP_IN | SQL_SP_BETWEEN |
+                            SQL_SP_COMPARISON | SQL_SP_QUANTIFIED_COMPARISON);
+
+    case SQL_SQL92_RELATIONAL_JOIN_OPERATORS:
+        GETINFO_RETURN_UINT(SQL_SRJO_CROSS_JOIN | SQL_SRJO_INNER_JOIN |
+                            SQL_SRJO_LEFT_OUTER_JOIN | SQL_SRJO_RIGHT_OUTER_JOIN |
+                            SQL_SRJO_FULL_OUTER_JOIN | SQL_SRJO_NATURAL_JOIN);
+
+    case SQL_SQL92_VALUE_EXPRESSIONS:
+        GETINFO_RETURN_UINT(SQL_SVE_CASE | SQL_SVE_CAST | SQL_SVE_COALESCE |
+                            SQL_SVE_NULLIF);
+
+    case SQL_DATETIME_LITERALS:
+        GETINFO_RETURN_UINT(SQL_DL_SQL92_DATE | SQL_DL_SQL92_TIME |
+                            SQL_DL_SQL92_TIMESTAMP);
+
+    case SQL_AGGREGATE_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_AF_ALL | SQL_AF_AVG | SQL_AF_COUNT |
+                            SQL_AF_DISTINCT | SQL_AF_MAX | SQL_AF_MIN | SQL_AF_SUM);
+
+    case SQL_NUMERIC_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_FN_NUM_ABS | SQL_FN_NUM_CEILING | SQL_FN_NUM_FLOOR |
+                            SQL_FN_NUM_MOD | SQL_FN_NUM_POWER | SQL_FN_NUM_ROUND |
+                            SQL_FN_NUM_SIGN | SQL_FN_NUM_SQRT | SQL_FN_NUM_TRUNCATE);
+
+    case SQL_STRING_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_FN_STR_CONCAT | SQL_FN_STR_LENGTH | SQL_FN_STR_LOCATE |
+                            SQL_FN_STR_LTRIM | SQL_FN_STR_RTRIM | SQL_FN_STR_SUBSTRING |
+                            SQL_FN_STR_LCASE | SQL_FN_STR_UCASE | SQL_FN_STR_REPLACE);
+
+    case SQL_SYSTEM_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_FN_SYS_IFNULL | SQL_FN_SYS_USERNAME);
+
+    case SQL_TIMEDATE_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_FN_TD_CURDATE | SQL_FN_TD_CURTIME | SQL_FN_TD_NOW |
+                            SQL_FN_TD_EXTRACT | SQL_FN_TD_YEAR | SQL_FN_TD_MONTH |
+                            SQL_FN_TD_DAYOFMONTH | SQL_FN_TD_HOUR | SQL_FN_TD_MINUTE |
+                            SQL_FN_TD_SECOND);
+
+    case SQL_CONVERT_FUNCTIONS:
+        GETINFO_RETURN_UINT(SQL_FN_CVT_CAST);
+
+    /* Conversion support flags — PostgreSQL supports most conversions via CAST */
+    case SQL_CONVERT_BIGINT:
+    case SQL_CONVERT_INTEGER:
+    case SQL_CONVERT_SMALLINT:
+    case SQL_CONVERT_TINYINT:
+    case SQL_CONVERT_FLOAT:
+    case SQL_CONVERT_REAL:
+    case SQL_CONVERT_DOUBLE:
+    case SQL_CONVERT_NUMERIC:
+    case SQL_CONVERT_DECIMAL:
+    case SQL_CONVERT_CHAR:
+    case SQL_CONVERT_VARCHAR:
+    case SQL_CONVERT_LONGVARCHAR:
+    case SQL_CONVERT_DATE:
+    case SQL_CONVERT_TIME:
+    case SQL_CONVERT_TIMESTAMP:
+    case SQL_CONVERT_BINARY:
+    case SQL_CONVERT_VARBINARY:
+    case SQL_CONVERT_LONGVARBINARY:
+    case SQL_CONVERT_BIT:
+        GETINFO_RETURN_UINT(SQL_CVT_CHAR | SQL_CVT_VARCHAR | SQL_CVT_LONGVARCHAR |
+                            SQL_CVT_INTEGER | SQL_CVT_SMALLINT | SQL_CVT_BIGINT |
+                            SQL_CVT_FLOAT | SQL_CVT_REAL | SQL_CVT_DOUBLE |
+                            SQL_CVT_NUMERIC | SQL_CVT_DECIMAL);
+
+    case SQL_POS_OPERATIONS:
+    case SQL_LOCK_TYPES:
+    case SQL_POSITIONED_STATEMENTS:
+    case SQL_BATCH_ROW_COUNT:
+    case SQL_BATCH_SUPPORT:
+    case SQL_PARAM_ARRAY_ROW_COUNTS:
+    case SQL_PARAM_ARRAY_SELECTS:
+    case SQL_INFO_SCHEMA_VIEWS:
+    case SQL_DDL_INDEX:
+    case SQL_CREATE_SCHEMA:
+    case SQL_DROP_SCHEMA:
+    case SQL_CREATE_ASSERTION:
+    case SQL_DROP_ASSERTION:
+    case SQL_CREATE_CHARACTER_SET:
+    case SQL_CREATE_COLLATION:
+    case SQL_CREATE_DOMAIN:
+    case SQL_CREATE_TRANSLATION:
+    case SQL_DROP_CHARACTER_SET:
+    case SQL_DROP_COLLATION:
+    case SQL_DROP_DOMAIN:
+    case SQL_DROP_TRANSLATION:
+    case SQL_INDEX_KEYWORDS:
+    case SQL_INSERT_STATEMENT:
+    case SQL_STANDARD_CLI_CONFORMANCE:
+    case SQL_ASYNC_MODE:
+        GETINFO_RETURN_UINT(0);
+
+    case SQL_FETCH_DIRECTION:
+        GETINFO_RETURN_UINT(SQL_FD_FETCH_NEXT);
+
+    case SQL_MAX_DRIVER_CONNECTIONS:
+    case SQL_MAX_CONCURRENT_ACTIVITIES:
+        GETINFO_RETURN_USHORT(0);  /* No limit */
+
+    default:
+        diagnostics_add_record(&connection->diagnostics,
+                               "HY096",  /* Information type out of range */
+                               0,
+                               "Unsupported information type in SQLGetInfo.");
+        return SQL_ERROR;
+    }
+
+    #undef GETINFO_RETURN_STRING
+    #undef GETINFO_RETURN_UINT
+    #undef GETINFO_RETURN_USHORT
+}
+
+/**
+ * SQLNumParams — Return the number of parameters in a prepared statement.
+ *
+ * Returns the count of parameter markers ('?') that were found during
+ * SQL text translation. Requires the statement to have been prepared
+ * (or at least to have had its SQL text translated via SQLPrepare or
+ * SQLExecDirect).
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle.
+ *   param_count_ptr  - Output: the number of parameter markers found.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Parameter count retrieved successfully.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlnumparams-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLNumParams(SQLHSTMT     statement_handle,
+             SQLSMALLINT *param_count_ptr)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    if (param_count_ptr) {
+        *param_count_ptr = (SQLSMALLINT)statement->detected_param_count;
+    }
+
+    return SQL_SUCCESS;
+}
+
+/**
+ * SQLNativeSql — Return the SQL string as modified by the driver.
+ *
+ * Shows the translated SQL that the driver would send to the data source.
+ * This driver translates ODBC '?' parameter markers to PostgreSQL '$N'
+ * markers and processes ODBC escape sequences.
+ *
+ * Parameters:
+ *   connection_handle  - A valid connection handle.
+ *   sql_text_in        - The input SQL string to translate.
+ *   text_length_in     - Length of sql_text_in, or SQL_NTS.
+ *   sql_text_out       - Output buffer for the translated SQL.
+ *   buffer_length      - Size of sql_text_out buffer.
+ *   text_length_out    - Output: actual length of the translated SQL.
+ *
+ * Returns:
+ *   SQL_SUCCESS           - Translation successful.
+ *   SQL_SUCCESS_WITH_INFO - Output was truncated.
+ *   SQL_ERROR             - Input is NULL or allocation failed.
+ *   SQL_INVALID_HANDLE    - connection_handle is not valid.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlnativesql-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLNativeSql(SQLHDBC     connection_handle,
+             SQLCHAR    *sql_text_in,
+             SQLINTEGER  text_length_in,
+             SQLCHAR    *sql_text_out,
+             SQLINTEGER  buffer_length,
+             SQLINTEGER *text_length_out)
+{
+    OdbcConnection *connection = (OdbcConnection *)connection_handle;
+
+    if (!connection || connection->magic_number != CONNECTION_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&connection->diagnostics);
+
+    if (!sql_text_in) {
+        diagnostics_add_record(&connection->diagnostics,
+                               "HY009", 0,
+                               "Input SQL text is NULL.");
+        return SQL_ERROR;
+    }
+
+    /* Resolve input length */
+    size_t input_length = (text_length_in == SQL_NTS)
+        ? strlen((const char *)sql_text_in)
+        : (size_t)text_length_in;
+
+    /* Make a null-terminated copy for the translator */
+    char *input_copy = malloc(input_length + 1);
+    if (!input_copy) {
+        diagnostics_add_record(&connection->diagnostics,
+                               "HY001", 0,
+                               "Memory allocation failed.");
+        return SQL_ERROR;
+    }
+    memcpy(input_copy, sql_text_in, input_length);
+    input_copy[input_length] = '\0';
+
+    /* Translate markers and escape sequences */
+    int param_count = 0;
+    char *translated = query_translate_markers(input_copy, &param_count, NULL, 0);
+    free(input_copy);
+
+    if (!translated) {
+        diagnostics_add_record(&connection->diagnostics,
+                               "HY001", 0,
+                               "Memory allocation failed during translation.");
+        return SQL_ERROR;
+    }
+
+    SQLINTEGER translated_length = (SQLINTEGER)strlen(translated);
+
+    if (text_length_out) {
+        *text_length_out = translated_length;
+    }
+
+    SQLRETURN result = SQL_SUCCESS;
+    if (sql_text_out && buffer_length > 0) {
+        SQLINTEGER copy_length = translated_length;
+        if (copy_length >= buffer_length) {
+            copy_length = buffer_length - 1;
+            diagnostics_add_record(&connection->diagnostics,
+                                   "01004", 0,
+                                   "Output SQL text was truncated.");
+            result = SQL_SUCCESS_WITH_INFO;
+        }
+        memcpy(sql_text_out, translated, (size_t)copy_length);
+        sql_text_out[copy_length] = '\0';
+    }
+
+    free(translated);
+    return result;
 }

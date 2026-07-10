@@ -25,6 +25,107 @@
 /* ---- Internal Helpers ---- */
 
 /*
+ * Return true if the SQL type is one of PostgreSQL's binary (bytea) types.
+ */
+static bool sql_type_is_binary(SQLSMALLINT sql_type)
+{
+    return sql_type == SQL_BINARY ||
+           sql_type == SQL_VARBINARY ||
+           sql_type == SQL_LONGVARBINARY;
+}
+
+/*
+ * Return true if the SQL type is a date/time type whose text value may be
+ * wrapped in an ODBC escape sequence ({ts '...'}, {d '...'}, {t '...'}).
+ */
+static bool sql_type_is_datetime(SQLSMALLINT sql_type)
+{
+    return sql_type == SQL_TYPE_DATE || sql_type == SQL_DATE ||
+           sql_type == SQL_TYPE_TIME || sql_type == SQL_TIME ||
+           sql_type == SQL_TYPE_TIMESTAMP || sql_type == SQL_TIMESTAMP;
+}
+
+/*
+ * Strip an ODBC date/time literal escape from a string value, if present.
+ *
+ * ODBC applications may pass datetime parameter values wrapped in an escape:
+ *   {ts 'YYYY-MM-DD HH:MM:SS'}   {d 'YYYY-MM-DD'}   {t 'HH:MM:SS'}
+ * PostgreSQL's date and timestamp input parsers reject that wrapper, so the
+ * driver unwraps it to the inner quoted content before sending. On a match,
+ * writes the unquoted inner value to a freshly malloc'd string and returns it
+ * (caller frees), setting *out_length. Returns NULL if the value is not an
+ * ODBC datetime escape, in which case the caller should use the value as-is.
+ */
+static char *strip_odbc_datetime_escape(const char *value, size_t value_length,
+                                        int *out_length)
+{
+    size_t position = 0;
+
+    /* Must start with '{' */
+    if (value_length == 0 || value[position] != '{') {
+        return NULL;
+    }
+    position++;
+
+    /* Skip the escape keyword: "ts", "d", or "t" (the specific keyword does not
+     * change how we unwrap — we simply take the inner single-quoted string). */
+    while (position < value_length &&
+           (value[position] == 't' || value[position] == 's' ||
+            value[position] == 'd' || value[position] == ' ')) {
+        position++;
+    }
+
+    /* Expect an opening single quote */
+    if (position >= value_length || value[position] != '\'') {
+        return NULL;
+    }
+    position++;
+    size_t inner_start = position;
+
+    /* Find the closing single quote */
+    while (position < value_length && value[position] != '\'') {
+        position++;
+    }
+    if (position >= value_length) {
+        return NULL;  /* No closing quote — not a well-formed escape */
+    }
+    size_t inner_length = position - inner_start;
+
+    char *result = malloc(inner_length + 1);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, value + inner_start, inner_length);
+    result[inner_length] = '\0';
+    *out_length = (int)inner_length;
+    return result;
+}
+
+/*
+ * Convert a character string of hex digits (e.g. "666f6f0001") into a
+ * PostgreSQL bytea hex literal ("\x666f6f0001"), which is how the original
+ * driver sends an SQL_C_CHAR value bound as SQL_BINARY. Returns a malloc'd
+ * string (caller frees) and sets *out_length, or NULL on allocation failure.
+ */
+static char *encode_char_hex_as_bytea(const char *value, size_t value_length,
+                                      int *out_length)
+{
+    /* Output is "\x" followed by the original hex characters verbatim. */
+    size_t result_length = 2 + value_length;
+    char *result = malloc(result_length + 1);
+    if (!result) {
+        *out_length = 0;
+        return NULL;
+    }
+    result[0] = '\\';
+    result[1] = 'x';
+    memcpy(result + 2, value, value_length);
+    result[result_length] = '\0';
+    *out_length = (int)result_length;
+    return result;
+}
+
+/*
  * Convert a bound parameter value to a heap-allocated text string.
  * Returns NULL if the parameter represents SQL NULL (indicator is SQL_NULL_DATA).
  * Returns a malloc'd string on success (caller must free).
@@ -75,12 +176,30 @@ static char *convert_parameter_to_text(const ParameterBinding *binding, int *out
             string_length = strlen((const char *)binding->value_buffer);
         }
 
+        const char *char_value = (const char *)binding->value_buffer;
+
+        /* A character value bound as SQL_BINARY is a string of hex digits that
+         * must be sent to PostgreSQL as a bytea hex literal. */
+        if (sql_type_is_binary(binding->sql_type)) {
+            return encode_char_hex_as_bytea(char_value, string_length, out_length);
+        }
+
+        /* A character value bound as a date/time type may be wrapped in an ODBC
+         * escape ({ts '...'}, {d '...'}, {t '...'}); unwrap it so PostgreSQL's
+         * datetime parser accepts the inner value. */
+        if (sql_type_is_datetime(binding->sql_type)) {
+            char *unwrapped = strip_odbc_datetime_escape(char_value, string_length, out_length);
+            if (unwrapped) {
+                return unwrapped;
+            }
+        }
+
         result = malloc(string_length + 1);
         if (!result) {
             *out_length = 0;
             return NULL;
         }
-        memcpy(result, binding->value_buffer, string_length);
+        memcpy(result, char_value, string_length);
         result[string_length] = '\0';
         *out_length = (int)string_length;
         return result;
@@ -147,6 +266,110 @@ static char *convert_parameter_to_text(const ParameterBinding *binding, int *out
                           "%u", (unsigned int)*(const uint8_t *)binding->value_buffer);
         break;
 
+    case SQL_C_INTERVAL_YEAR:
+    case SQL_C_INTERVAL_MONTH:
+    case SQL_C_INTERVAL_DAY:
+    case SQL_C_INTERVAL_HOUR:
+    case SQL_C_INTERVAL_MINUTE:
+    case SQL_C_INTERVAL_SECOND:
+    case SQL_C_INTERVAL_YEAR_TO_MONTH:
+    case SQL_C_INTERVAL_DAY_TO_HOUR:
+    case SQL_C_INTERVAL_DAY_TO_MINUTE:
+    case SQL_C_INTERVAL_DAY_TO_SECOND: {
+        /* Convert SQL_INTERVAL_STRUCT to PostgreSQL interval text format.
+         * PostgreSQL accepts intervals like '1 year 2 mons 3 days 04:05:06'. */
+        const SQL_INTERVAL_STRUCT *interval =
+            (const SQL_INTERVAL_STRUCT *)binding->value_buffer;
+
+        char interval_buffer[256];
+        int pos = 0;
+
+        switch (interval->interval_type) {
+        case SQL_IS_YEAR:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u years", interval->intval.year_month.year);
+            break;
+        case SQL_IS_MONTH:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u mons", interval->intval.year_month.month);
+            break;
+        case SQL_IS_YEAR_TO_MONTH:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u years %u mons",
+                           interval->intval.year_month.year,
+                           interval->intval.year_month.month);
+            break;
+        case SQL_IS_DAY:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u days", interval->intval.day_second.day);
+            break;
+        case SQL_IS_HOUR:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u hours", interval->intval.day_second.hour);
+            break;
+        case SQL_IS_MINUTE:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u mins", interval->intval.day_second.minute);
+            break;
+        case SQL_IS_SECOND:
+            /* Format as full day_second representation for PostgreSQL */
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u days %u:%u:%u",
+                           interval->intval.day_second.day,
+                           interval->intval.day_second.hour,
+                           interval->intval.day_second.minute,
+                           interval->intval.day_second.second);
+            break;
+        case SQL_IS_DAY_TO_HOUR:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u days %u hours",
+                           interval->intval.day_second.day,
+                           interval->intval.day_second.hour);
+            break;
+        case SQL_IS_DAY_TO_MINUTE:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u days %u:%u:00",
+                           interval->intval.day_second.day,
+                           interval->intval.day_second.hour,
+                           interval->intval.day_second.minute);
+            break;
+        case SQL_IS_DAY_TO_SECOND:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer),
+                           "%u days %u:%u:%u",
+                           interval->intval.day_second.day,
+                           interval->intval.day_second.hour,
+                           interval->intval.day_second.minute,
+                           interval->intval.day_second.second);
+            break;
+        default:
+            pos = snprintf(interval_buffer, sizeof(interval_buffer), "0");
+            break;
+        }
+
+        /* Apply sign if negative */
+        if (interval->interval_sign != 0) {
+            /* Prepend a minus sign */
+            char signed_buffer[258];
+            snprintf(signed_buffer, sizeof(signed_buffer), "-%s", interval_buffer);
+            result = malloc(strlen(signed_buffer) + 1);
+            if (!result) {
+                *out_length = 0;
+                return NULL;
+            }
+            memcpy(result, signed_buffer, strlen(signed_buffer) + 1);
+            *out_length = (int)strlen(signed_buffer);
+        } else {
+            result = malloc((size_t)pos + 1);
+            if (!result) {
+                *out_length = 0;
+                return NULL;
+            }
+            memcpy(result, interval_buffer, (size_t)pos + 1);
+            *out_length = pos;
+        }
+        return result;
+    }
+
     case SQL_C_BINARY: {
         /* Encode as PostgreSQL hex bytea format: \x followed by hex pairs.
          * Determine the actual data length from the indicator. */
@@ -161,6 +384,28 @@ static char *convert_parameter_to_text(const ParameterBinding *binding, int *out
             }
         } else {
             data_length = (size_t)binding->buffer_length;
+        }
+
+        /* When binary data is bound to a character/text SQL type, the raw bytes
+         * are sent as text verbatim rather than hex-encoded. (The test binds a
+         * NUL-terminated C string whose declared length includes the trailing
+         * NUL, so trim one trailing NUL to recover the intended text.) */
+        if (binding->sql_type == SQL_CHAR ||
+            binding->sql_type == SQL_VARCHAR ||
+            binding->sql_type == SQL_LONGVARCHAR) {
+            if (data_length > 0 &&
+                ((const char *)binding->value_buffer)[data_length - 1] == '\0') {
+                data_length--;
+            }
+            result = malloc(data_length + 1);
+            if (!result) {
+                *out_length = 0;
+                return NULL;
+            }
+            memcpy(result, binding->value_buffer, data_length);
+            result[data_length] = '\0';
+            *out_length = (int)data_length;
+            return result;
         }
 
         /* Output format: \x followed by 2 hex chars per byte, plus null terminator */

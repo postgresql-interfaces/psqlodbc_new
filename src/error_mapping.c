@@ -76,10 +76,27 @@ void error_extract_from_result(const PGresult *result,
         return;
     }
 
-    /* Build the combined message. Start with the primary message, then
+    /* Prefix the message with the severity label (e.g. "ERROR", "FATAL").
+     * The original psqlodbc driver builds diagnostic messages as
+     * "<severity>: <primary>" for backward compatibility, and ODBC
+     * applications (and the regression test suite) expect this exact form.
+     * Prefer the non-localized severity so the text is stable regardless of
+     * the server's lc_messages setting; fall back to the localized field. */
+    const char *severity = PQresultErrorField(result, PG_DIAG_SEVERITY_NONLOCALIZED);
+    if (!severity) {
+        severity = PQresultErrorField(result, PG_DIAG_SEVERITY);
+    }
+
+    /* Build the combined message. Start with "<severity>: <primary>", then
      * append DETAIL and HINT on separate lines if available. This matches
      * what psql displays and what applications expect. */
-    int written = snprintf(out_message, message_buffer_size, "%s", primary_message);
+    int written;
+    if (severity) {
+        written = snprintf(out_message, message_buffer_size, "%s: %s",
+                           severity, primary_message);
+    } else {
+        written = snprintf(out_message, message_buffer_size, "%s", primary_message);
+    }
 
     if (detail_message && written > 0 && (size_t)written < message_buffer_size) {
         written += snprintf(out_message + written,
@@ -144,6 +161,14 @@ void error_add_diagnostic_from_result(DiagnosticRecords *diagnostics,
                                       const PGresult *result,
                                       const char *fallback_sqlstate)
 {
+    error_add_diagnostic_from_result_ctx(diagnostics, result, fallback_sqlstate, NULL);
+}
+
+void error_add_diagnostic_from_result_ctx(DiagnosticRecords *diagnostics,
+                                          const PGresult *result,
+                                          const char *fallback_sqlstate,
+                                          const char *driver_context)
+{
     if (!diagnostics) {
         return;
     }
@@ -152,6 +177,16 @@ void error_add_diagnostic_from_result(DiagnosticRecords *diagnostics,
     char message[MAX_ERROR_MESSAGE_LENGTH];
 
     error_extract_from_result(result, fallback_sqlstate, sqlstate, message, sizeof(message));
+
+    /* Append the driver-level context that describes which operation failed
+     * (e.g. "Error while executing the query"). The original psqlodbc driver
+     * joins the server message and its own context with ";\n"; the regression
+     * suite compares against that exact form. */
+    if (driver_context && driver_context[0] != '\0') {
+        size_t current_length = strlen(message);
+        snprintf(message + current_length, sizeof(message) - current_length,
+                 ";\n%s", driver_context);
+    }
 
     /* Use PG_DIAG_STATEMENT_POSITION as the native error code.
      * This is the character offset (1-based) in the query where the error

@@ -28,3 +28,9 @@ EXPORTS
     SQLBindCol        @26
     SQLSetStmtAttr    @27
     SQLGetStmtAttr    @28
+    SQLSetEnvAttr     @29
+    SQLGetEnvAttr     @30
+    SQLColAttribute   @31
+    SQLGetInfo        @32
+    SQLNumParams      @33
+    SQLNativeSql      @34

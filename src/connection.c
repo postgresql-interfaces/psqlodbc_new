@@ -20,6 +20,49 @@
 #include <string.h>
 #include <stdio.h>
 
+/*
+ * Return the maximum number of bytes a single character can occupy in the
+ * given PostgreSQL client encoding name. Used to translate a column's
+ * character-count size into a worst-case octet (byte) length.
+ *
+ * Only the multibyte encodings that differ from 1 are enumerated; anything
+ * unrecognized (including all single-byte encodings such as LATIN1 and SQL_ASCII)
+ * defaults to 1. Values match PostgreSQL's pg_wchar.h maxmblen table.
+ */
+static int max_bytes_per_char_for_encoding(const char *encoding_name)
+{
+    if (!encoding_name) {
+        return 1;
+    }
+    /* UTF-8 is by far the common case and allows up to 4 bytes per character. */
+    if (strcmp(encoding_name, "UTF8") == 0) {
+        return 4;
+    }
+    /* Encodings that use up to 4 bytes per character. */
+    if (strcmp(encoding_name, "GB18030") == 0) {
+        return 4;
+    }
+    /* Encodings that use up to 3 bytes per character. */
+    if (strcmp(encoding_name, "EUC_JP") == 0 ||
+        strcmp(encoding_name, "EUC_CN") == 0 ||
+        strcmp(encoding_name, "EUC_KR") == 0 ||
+        strcmp(encoding_name, "EUC_TW") == 0 ||
+        strcmp(encoding_name, "EUC_JIS_2004") == 0 ||
+        strcmp(encoding_name, "MULE_INTERNAL") == 0) {
+        return 3;
+    }
+    /* Encodings that use up to 2 bytes per character. */
+    if (strcmp(encoding_name, "SJIS") == 0 ||
+        strcmp(encoding_name, "BIG5") == 0 ||
+        strcmp(encoding_name, "GBK") == 0 ||
+        strcmp(encoding_name, "UHC") == 0 ||
+        strcmp(encoding_name, "JOHAB") == 0 ||
+        strcmp(encoding_name, "SHIFT_JIS_2004") == 0) {
+        return 2;
+    }
+    return 1;
+}
+
 SQLRETURN connection_allocate(OdbcEnvironment *environment, SQLHANDLE *output_handle)
 {
     if (!environment || !output_handle) {
@@ -94,6 +137,7 @@ SQLRETURN connection_free(SQLHANDLE handle)
 
     /* Clean up all resources */
     diagnostics_clear(&connection->diagnostics);
+    connection_clear_notices(connection);
     connection_info_clear(&connection->info);
 
     /* Poison the magic number to detect use-after-free */
@@ -101,6 +145,63 @@ SQLRETURN connection_free(SQLHANDLE handle)
     free(connection);
 
     return SQL_SUCCESS;
+}
+
+void connection_clear_notices(OdbcConnection *connection)
+{
+    if (!connection) {
+        return;
+    }
+    for (int i = 0; i < connection->notice_count; i++) {
+        free(connection->captured_notices[i]);
+        connection->captured_notices[i] = NULL;
+    }
+    connection->notice_count = 0;
+}
+
+/*
+ * libpq notice receiver callback. Called by libpq whenever PostgreSQL sends
+ * a NOTICE or WARNING message (e.g., "table already exists", implicit index
+ * creation, etc.). We extract the message and store it on the connection for
+ * later promotion to ODBC diagnostic records.
+ *
+ * We construct the message in the format "SEVERITY: primary_message" to match
+ * the original psqlodbc driver's behavior.
+ */
+static void notice_receiver_callback(void *context, const PGresult *notice_result)
+{
+    OdbcConnection *connection = (OdbcConnection *)context;
+    if (!connection || connection->notice_count >= MAX_CAPTURED_NOTICES) {
+        return;
+    }
+
+    /* Extract individual message fields for clean formatting */
+    const char *severity = PQresultErrorField(notice_result, PG_DIAG_SEVERITY);
+    const char *primary = PQresultErrorField(notice_result, PG_DIAG_MESSAGE_PRIMARY);
+
+    if (!primary || primary[0] == '\0') {
+        return;
+    }
+
+    /* Format: "NOTICE: message text" (single space after colon) */
+    const char *sev = severity ? severity : "NOTICE";
+    size_t sev_len = strlen(sev);
+    size_t msg_len = strlen(primary);
+    /* "SEVERITY: message\0" */
+    size_t total_len = sev_len + 2 + msg_len;
+
+    char *copy = malloc(total_len + 1);
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, sev, sev_len);
+    copy[sev_len] = ':';
+    copy[sev_len + 1] = ' ';
+    memcpy(copy + sev_len + 2, primary, msg_len);
+    copy[total_len] = '\0';
+
+    connection->captured_notices[connection->notice_count] = copy;
+    connection->notice_count++;
 }
 
 SQLRETURN connection_connect(OdbcConnection *connection)
@@ -149,12 +250,21 @@ SQLRETURN connection_connect(OdbcConnection *connection)
 
     connection->state = CONNECTION_STATE_CONNECTED;
 
+    /* Install notice receiver to capture NOTICE/WARNING messages from PostgreSQL.
+     * These are promoted to ODBC diagnostic records after statement execution. */
+    PQsetNoticeReceiver(connection->libpq_connection, notice_receiver_callback, connection);
+
     /* Parse the server version for feature detection.
      * PQserverVersion returns an integer like 150002 for 15.0.2
      * (major * 10000 + minor * 100 + patch). */
     int version_number = PQserverVersion(connection->libpq_connection);
     connection->server_version_major = version_number / 10000;
     connection->server_version_minor = (version_number / 100) % 100;
+
+    /* Determine the worst-case bytes-per-character for the negotiated client
+     * encoding, used when reporting octet lengths of character columns. */
+    connection->max_bytes_per_char =
+        max_bytes_per_char_for_encoding(pg_encoding_to_char(PQclientEncoding(connection->libpq_connection)));
 
     return SQL_SUCCESS;
 }
@@ -210,6 +320,13 @@ void connection_info_clear(ConnectionInfo *info)
     memset(info->sslmode, 0, sizeof(info->sslmode));
     memset(info->application_name, 0, sizeof(info->application_name));
     info->connect_timeout = 0;
+
+    /* BoolsAsChar defaults to on, matching the original psqlodbc driver. */
+    info->bools_as_char = true;
+
+    /* Size-reporting defaults match the original psqlodbc driver. */
+    info->unknown_sizes = UNKNOWN_SIZES_MAX;
+    info->max_varchar_size = DEFAULT_MAX_VARCHAR_SIZE;
 }
 
 bool connection_add_statement(OdbcConnection *connection,
