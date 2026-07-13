@@ -79,6 +79,14 @@ SQLRETURN connection_allocate(OdbcEnvironment *environment, SQLHANDLE *output_ha
     connection->state = CONNECTION_STATE_NOT_CONNECTED;
     connection->parent_environment = environment;
     connection->autocommit = true;
+
+    /* Apply the driver's default connection options (BoolsAsChar on, size
+     * reporting, etc.) before any connection string is parsed. calloc zeroed the
+     * struct, which is NOT the correct default for every field — notably
+     * bools_as_char must default to true — so initialize it explicitly here.
+     * SQLDriverConnect/SQLConnect then overlay only the keywords the application
+     * supplies. */
+    connection_info_clear(&connection->info);
     connection->transaction_state = TRANSACTION_STATE_IDLE;
     connection->txn_isolation = SQL_TXN_READ_COMMITTED;  /* PostgreSQL default */
     connection->login_timeout = 0;
@@ -157,6 +165,21 @@ void connection_clear_notices(OdbcConnection *connection)
         connection->captured_notices[i] = NULL;
     }
     connection->notice_count = 0;
+}
+
+bool connection_standard_conforming_strings(const OdbcConnection *connection)
+{
+    if (!connection || !connection->libpq_connection) {
+        return true;
+    }
+    const char *status = PQparameterStatus(connection->libpq_connection,
+                                           "standard_conforming_strings");
+    if (!status) {
+        /* Pre-8.1 server or unknown — assume off would over-escape modern
+         * strings, so default to on to match current PostgreSQL. */
+        return true;
+    }
+    return strcmp(status, "on") == 0;
 }
 
 /*

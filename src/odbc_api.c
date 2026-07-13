@@ -440,6 +440,16 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         SQL_API_SQLGETINFO,
         SQL_API_SQLNUMPARAMS,
         SQL_API_SQLNATIVESQL,
+        SQL_API_SQLSETDESCFIELD,
+        SQL_API_SQLGETDESCFIELD,
+        SQL_API_SQLMORERESULTS,
+        SQL_API_SQLGETTYPEINFO,
+        SQL_API_SQLCOLUMNPRIVILEGES,
+        SQL_API_SQLTABLEPRIVILEGES,
+        SQL_API_SQLSTATISTICS,
+        SQL_API_SQLPROCEDURES,
+        SQL_API_SQLPROCEDURECOLUMNS,
+        SQL_API_SQLSPECIALCOLUMNS,
     };
     int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
 
@@ -1121,6 +1131,77 @@ SQLGetData(SQLHSTMT     statement_handle,
 }
 
 /**
+ * SQLMoreResults — Determine whether more result sets are available and, if so,
+ * make the next one current.
+ *
+ * A single SQLExecDirect/SQLExecute of a multi-statement query (e.g.
+ * "SELECT 1; SELECT 2") produces one result set per statement. After the
+ * application finishes with the current result set, SQLMoreResults advances to
+ * the next one so it can be described and fetched. When the last result set has
+ * been consumed, SQL_NO_DATA is returned.
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle that has been executed.
+ *
+ * Returns:
+ *   SQL_SUCCESS / SQL_SUCCESS_WITH_INFO - the next result set is now current.
+ *   SQL_NO_DATA        - no more result sets are available.
+ *   SQL_ERROR          - the next result set reported an error.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlmoreresults-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLMoreResults(SQLHSTMT statement_handle)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return results_more_results(statement);
+}
+
+/**
+ * SQLGetTypeInfo — Return information about the data types supported by the
+ * data source.
+ *
+ * Produces a result set with one row per supported SQL type describing its
+ * name, SQL data type, precision, literal prefix/suffix, create parameters,
+ * nullability, case sensitivity, searchability, and related attributes. The
+ * rows are ordered by DATA_TYPE per the ODBC spec.
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle.
+ *   data_type        - SQL_ALL_TYPES for every type, or a specific SQL type
+ *                      constant (e.g. SQL_VARCHAR) to return only that type.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Result set is available for fetching.
+ *   SQL_ERROR          - Query failed.
+ *   SQL_INVALID_HANDLE - statement_handle is not valid.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgettypeinfo-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetTypeInfo(SQLHSTMT    statement_handle,
+               SQLSMALLINT data_type)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return catalog_get_type_info(statement, data_type);
+}
+
+/**
  * SQLTables — List tables, views, and other relations in the data source.
  *
  * Returns a result set with one row per matching relation. The result set
@@ -1333,6 +1414,135 @@ SQLForeignKeys(SQLHSTMT     statement_handle,
                                 fk_catalog_name, fk_name_length1,
                                 fk_schema_name, fk_name_length2,
                                 fk_table_name, fk_name_length3);
+}
+
+/**
+ * SQLColumnPrivileges — List the privileges on the columns of a table.
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlcolumnprivileges-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLColumnPrivileges(SQLHSTMT     statement_handle,
+                    SQLCHAR     *catalog_name, SQLSMALLINT name_length1,
+                    SQLCHAR     *schema_name,  SQLSMALLINT name_length2,
+                    SQLCHAR     *table_name,   SQLSMALLINT name_length3,
+                    SQLCHAR     *column_name,  SQLSMALLINT name_length4)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_column_privileges(statement, catalog_name, name_length1,
+                                     schema_name, name_length2,
+                                     table_name, name_length3,
+                                     column_name, name_length4);
+}
+
+/**
+ * SQLTablePrivileges — List the privileges on tables matching the patterns.
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqltableprivileges-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLTablePrivileges(SQLHSTMT     statement_handle,
+                   SQLCHAR     *catalog_name,   SQLSMALLINT name_length1,
+                   SQLCHAR     *schema_pattern, SQLSMALLINT name_length2,
+                   SQLCHAR     *table_pattern,  SQLSMALLINT name_length3)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_table_privileges(statement, catalog_name, name_length1,
+                                    schema_pattern, name_length2,
+                                    table_pattern, name_length3);
+}
+
+/**
+ * SQLStatistics — List the indexes and statistics for a table.
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlstatistics-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLStatistics(SQLHSTMT     statement_handle,
+              SQLCHAR     *catalog_name, SQLSMALLINT name_length1,
+              SQLCHAR     *schema_name,  SQLSMALLINT name_length2,
+              SQLCHAR     *table_name,   SQLSMALLINT name_length3,
+              SQLUSMALLINT unique, SQLUSMALLINT reserved)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_statistics(statement, catalog_name, name_length1,
+                              schema_name, name_length2,
+                              table_name, name_length3, unique, reserved);
+}
+
+/**
+ * SQLProcedures — List the procedures/functions matching the patterns.
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlprocedures-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLProcedures(SQLHSTMT     statement_handle,
+              SQLCHAR     *catalog_name,   SQLSMALLINT name_length1,
+              SQLCHAR     *schema_pattern, SQLSMALLINT name_length2,
+              SQLCHAR     *proc_pattern,   SQLSMALLINT name_length3)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_procedures(statement, catalog_name, name_length1,
+                              schema_pattern, name_length2,
+                              proc_pattern, name_length3);
+}
+
+/**
+ * SQLProcedureColumns — List the input/output/result columns of procedures.
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlprocedurecolumns-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLProcedureColumns(SQLHSTMT     statement_handle,
+                    SQLCHAR     *catalog_name,   SQLSMALLINT name_length1,
+                    SQLCHAR     *schema_pattern, SQLSMALLINT name_length2,
+                    SQLCHAR     *proc_pattern,   SQLSMALLINT name_length3,
+                    SQLCHAR     *column_pattern, SQLSMALLINT name_length4)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_procedure_columns(statement, catalog_name, name_length1,
+                                     schema_pattern, name_length2,
+                                     proc_pattern, name_length3,
+                                     column_pattern, name_length4);
+}
+
+/**
+ * SQLSpecialColumns — List the optimal set of columns that uniquely identify a
+ * row (SQL_BEST_ROWID) or that are automatically updated (SQL_ROWVER).
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlspecialcolumns-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSpecialColumns(SQLHSTMT     statement_handle,
+                  SQLUSMALLINT identifier_type,
+                  SQLCHAR     *catalog_name, SQLSMALLINT name_length1,
+                  SQLCHAR     *schema_name,  SQLSMALLINT name_length2,
+                  SQLCHAR     *table_name,   SQLSMALLINT name_length3,
+                  SQLUSMALLINT scope, SQLUSMALLINT nullable)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+    diagnostics_clear(&statement->diagnostics);
+    return catalog_special_columns(statement, identifier_type,
+                                   catalog_name, name_length1,
+                                   schema_name, name_length2,
+                                   table_name, name_length3, scope, nullable);
 }
 
 /**
@@ -1779,6 +1989,12 @@ SQLSetConnectAttr(SQLHDBC     connection_handle,
 
         return SQL_SUCCESS;
     }
+
+    case SQL_ATTR_PGOPT_MSJET:
+        /* MS Access sets this to request Jet-compatibility behavior; the only
+         * effect we implement is the ("col" = 1) boolean rewrite in the parser. */
+        connection->ms_jet = (value_as_uint != 0);
+        return SQL_SUCCESS;
 
     default:
         diagnostics_add_record(&connection->diagnostics,
@@ -2239,11 +2455,32 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         }
         return SQL_SUCCESS;
 
-    case SQL_ATTR_IMP_ROW_DESC:
     case SQL_ATTR_IMP_PARAM_DESC:
+        /* Return the statement's embedded implicit parameter descriptor so the
+         * application can name parameters via SQLSetDescField. */
+        if (value_ptr) {
+            *(SQLHANDLE *)value_ptr = (SQLHANDLE)&statement->implicit_param_descriptor;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLHANDLE);
+        }
+        return SQL_SUCCESS;
+
     case SQL_ATTR_APP_ROW_DESC:
+        /* Return the statement's embedded application row descriptor so the
+         * application can set per-column formatting via SQLSetDescField
+         * (notably SQL_DESC_PRECISION for interval fractional seconds). */
+        if (value_ptr) {
+            *(SQLHANDLE *)value_ptr = (SQLHANDLE)&statement->app_row_descriptor;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLHANDLE);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_IMP_ROW_DESC:
     case SQL_ATTR_APP_PARAM_DESC:
-        /* Descriptor handles are not yet implemented */
+        /* Other descriptor handles are not implemented */
         if (value_ptr) {
             *(SQLHANDLE *)value_ptr = SQL_NULL_HANDLE;
         }
@@ -2826,9 +3063,13 @@ SQLGetInfo(SQLHDBC      connection_handle,
 
     diagnostics_clear(&connection->diagnostics);
 
-    /* Internal helper: copy a string to the info_value buffer and report length */
+    /* Internal helper: copy a string to the info_value buffer and report length.
+     * The argument is first decayed to a pointer via _src so the null check does
+     * not trigger -Waddress when a caller passes a stack array (e.g. version_buffer),
+     * whose address is always non-NULL. */
     #define GETINFO_RETURN_STRING(str) do { \
-        const char *_s = (str) ? (str) : ""; \
+        const char *_src = (str); \
+        const char *_s = _src ? _src : ""; \
         SQLSMALLINT _len = (SQLSMALLINT)strlen(_s); \
         if (string_length) { *string_length = _len; } \
         if (info_value && buffer_length > 0) { \
@@ -3396,4 +3637,164 @@ SQLNativeSql(SQLHDBC     connection_handle,
 
     free(translated);
     return result;
+}
+
+/**
+ * SQLSetDescField — Set a single field of a descriptor record.
+ *
+ * The driver exposes only the implicit parameter descriptor (IPD). The one
+ * field it honors is SQL_DESC_NAME, which names a parameter marker so that
+ * procedure calls can bind arguments by name and map named OUT parameters back
+ * from the result set. Other fields are accepted and ignored so that callers
+ * are not forced to special-case this driver.
+ *
+ * Parameters:
+ *   descriptor_handle - An IPD handle obtained from
+ *                       SQLGetStmtAttr(SQL_ATTR_IMP_PARAM_DESC).
+ *   record_number     - The 1-based parameter position to describe.
+ *   field_identifier  - The descriptor field to set (SQL_DESC_NAME honored).
+ *   value             - The field value (a string for SQL_DESC_NAME).
+ *   buffer_length     - Length of value in bytes, or SQL_NTS.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Field set (or accepted and ignored).
+ *   SQL_ERROR          - Invalid record number.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid IPD handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetdescfield-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSetDescField(SQLHDESC    descriptor_handle,
+                SQLSMALLINT record_number,
+                SQLSMALLINT field_identifier,
+                SQLPOINTER  value,
+                SQLINTEGER  buffer_length)
+{
+    OdbcDescriptor *descriptor = (OdbcDescriptor *)descriptor_handle;
+
+    if (!descriptor || descriptor->magic_number != DESCRIPTOR_MAGIC_NUMBER ||
+        !descriptor->owner) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    OdbcStatement *statement = descriptor->owner;
+
+    /* On the application row descriptor (ARD), the only field we honor is
+     * SQL_DESC_PRECISION, which overrides the fractional-second precision used
+     * when formatting an interval result column. record_number is the 1-based
+     * column position. The stored value is later clamped to <= 9 at use, so an
+     * arbitrarily large precision here cannot overrun any buffer. */
+    if (descriptor->role == DESCRIPTOR_ROLE_APP_ROW) {
+        if (field_identifier != SQL_DESC_PRECISION) {
+            return SQL_SUCCESS;  /* Other ARD fields accepted and ignored. */
+        }
+        if (record_number < 1 || record_number > MAX_BOUND_COLUMNS) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "07009",  /* Invalid descriptor index */
+                                   0,
+                                   "Column number is out of range in SQLSetDescField.");
+            return SQL_ERROR;
+        }
+        /* SQL_DESC_PRECISION is passed as an integer smuggled through the
+         * pointer parameter (SQLSetDescField's value is SQLPOINTER). */
+        statement->column_precision_override[record_number - 1] =
+            (int)(intptr_t)value;
+        return SQL_SUCCESS;
+    }
+
+    /* Implicit parameter descriptor (IPD): we only act on SQL_DESC_NAME; other
+     * fields are accepted silently. */
+    if (field_identifier != SQL_DESC_NAME) {
+        return SQL_SUCCESS;
+    }
+
+    if (record_number < 1 || record_number > MAX_PARAMETERS) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "07009",  /* Invalid descriptor index */
+                               0,
+                               "Parameter number is out of range in SQLSetDescField.");
+        return SQL_ERROR;
+    }
+
+    ParameterBinding *binding = &statement->parameter_bindings[record_number - 1];
+
+    if (!value) {
+        binding->name[0] = '\0';
+        return SQL_SUCCESS;
+    }
+
+    size_t name_length = (buffer_length == SQL_NTS)
+        ? strlen((const char *)value)
+        : (size_t)buffer_length;
+    if (name_length >= sizeof(binding->name)) {
+        name_length = sizeof(binding->name) - 1;
+    }
+    memcpy(binding->name, value, name_length);
+    binding->name[name_length] = '\0';
+    return SQL_SUCCESS;
+}
+
+/**
+ * SQLGetDescField — Retrieve a single field of a descriptor record.
+ *
+ * Complements SQLSetDescField for the implicit parameter descriptor. Only
+ * SQL_DESC_NAME is meaningfully supported; other fields report empty/zero.
+ *
+ * Parameters:
+ *   descriptor_handle - An IPD handle from SQLGetStmtAttr(SQL_ATTR_IMP_PARAM_DESC).
+ *   record_number     - The 1-based parameter position.
+ *   field_identifier  - The descriptor field to read (SQL_DESC_NAME supported).
+ *   value             - Output buffer for the field value.
+ *   buffer_length     - Size of value in bytes.
+ *   string_length     - Output: actual length of a string field.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Field retrieved.
+ *   SQL_ERROR          - Invalid record number.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid IPD handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetdescfield-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetDescField(SQLHDESC    descriptor_handle,
+                SQLSMALLINT record_number,
+                SQLSMALLINT field_identifier,
+                SQLPOINTER  value,
+                SQLINTEGER  buffer_length,
+                SQLINTEGER *string_length)
+{
+    OdbcDescriptor *descriptor = (OdbcDescriptor *)descriptor_handle;
+
+    if (!descriptor || descriptor->magic_number != DESCRIPTOR_MAGIC_NUMBER ||
+        !descriptor->owner) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    OdbcStatement *statement = descriptor->owner;
+
+    if (field_identifier != SQL_DESC_NAME) {
+        if (string_length) {
+            *string_length = 0;
+        }
+        return SQL_SUCCESS;
+    }
+
+    if (record_number < 1 || record_number > MAX_PARAMETERS) {
+        return SQL_ERROR;
+    }
+
+    const char *name = statement->parameter_bindings[record_number - 1].name;
+    SQLINTEGER name_length = (SQLINTEGER)strlen(name);
+    if (string_length) {
+        *string_length = name_length;
+    }
+    if (value && buffer_length > 0) {
+        SQLINTEGER copy_length = name_length;
+        if (copy_length >= buffer_length) {
+            copy_length = buffer_length - 1;
+        }
+        memcpy(value, name, (size_t)copy_length);
+        ((char *)value)[copy_length] = '\0';
+    }
+    return SQL_SUCCESS;
 }

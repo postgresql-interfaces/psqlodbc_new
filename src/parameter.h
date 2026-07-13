@@ -15,6 +15,7 @@
 #define PSQLODBC2_PARAMETER_H
 
 #include "psqlodbc2.h"
+#include "query_parser.h"
 #include <stdbool.h>
 
 /* Maximum number of parameters supported per statement.
@@ -38,6 +39,11 @@ typedef struct ParameterBinding {
     SQLLEN buffer_length;            /* Size of the application's data buffer in bytes */
     SQLLEN *indicator_or_length;     /* Pointer to length/indicator variable (SQL_NULL_DATA, SQL_NTS, or byte count) */
     bool is_bound;                   /* True if this slot has been bound by the application */
+
+    /* Optional parameter name, set via SQLSetDescField(IPD, SQL_DESC_NAME).
+     * Used for procedure calls to emit named notation ("name" := value) and to
+     * match OUT/INOUT result columns by name. Empty string when unnamed. */
+    char name[64];
 } ParameterBinding;
 
 /* ---- Parameter Management Functions ---- */
@@ -66,6 +72,14 @@ SQLRETURN parameter_bind(ParameterBinding *bindings,
  * Clear all parameter bindings, resetting the array and count to zero.
  */
 void parameter_unbind_all(ParameterBinding *bindings, int *bound_count);
+
+/*
+ * Convert a single bound parameter value to a heap-allocated PostgreSQL text
+ * string (caller frees). Returns NULL for SQL NULL. Sets *out_length to the
+ * byte length. Exposed so the procedure-call executor can build one argument
+ * value at a time.
+ */
+char *convert_parameter_to_text(const ParameterBinding *binding, int *out_length);
 
 /*
  * Build the parallel arrays required by PQexecPrepared / PQexecParams.
@@ -100,5 +114,10 @@ void parameter_free_libpq_arrays(const char **values,
                                  int *lengths,
                                  int *formats,
                                  int count);
+
+/* PostgreSQL pseudo-type OID used when binding procedure-call arguments.
+ * "unknown" lets PostgreSQL resolve function overloads from context. It is a
+ * stable built-in OID. */
+#define PG_OID_UNKNOWN 705
 
 #endif /* PSQLODBC2_PARAMETER_H */

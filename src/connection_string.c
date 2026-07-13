@@ -106,6 +106,30 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
         safe_copy_to_buffer(size_buffer, sizeof(size_buffer), value, value_length);
         info->max_varchar_size = (int)strtol(size_buffer, NULL, 10);
 
+    } else if (case_insensitive_compare(key, "Parse") == 0) {
+        /* Enable client-side SELECT parsing for refined column metadata. */
+        char parse_buffer[16];
+        safe_copy_to_buffer(parse_buffer, sizeof(parse_buffer), value, value_length);
+        info->parse_statements = (strtol(parse_buffer, NULL, 10) != 0);
+
+    } else if (case_insensitive_compare(key, "FetchRefcursors") == 0) {
+        /* When enabled, refcursor OUT parameters returned by a called function
+         * are automatically FETCH ALL'd and exposed as successive result sets. */
+        char refcursor_buffer[16];
+        safe_copy_to_buffer(refcursor_buffer, sizeof(refcursor_buffer), value, value_length);
+        info->fetch_refcursors = (strtol(refcursor_buffer, NULL, 10) != 0);
+
+    } else if (case_insensitive_compare(key, "Fetch") == 0) {
+        /* Cursor fetch cache size in the original driver. This modern driver
+         * materializes whole result sets, so the cache size has no effect; the
+         * keyword is accepted (and ignored) for connection-string compatibility
+         * with applications and tests that set it. */
+
+    } else if (case_insensitive_compare(key, "DisallowPremature") == 0) {
+        /* Accepted for compatibility with the original driver; the modern
+         * implementation always describes results after execution, so there is
+         * no "premature" describe to disallow. No stored effect. */
+
     } else if (case_insensitive_compare(key, "DSN") == 0) {
         /* Resolve the DSN from odbc.ini to populate connection defaults.
          * Subsequent keys in the connection string will override these values

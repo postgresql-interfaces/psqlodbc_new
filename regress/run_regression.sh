@@ -175,7 +175,11 @@ for test_name in $TESTS; do
         continue
     fi
 
-    # Compare against expected output
+    # Compare against expected output. Upstream psqlodbc allows a test to have
+    # several acceptable outputs: the base "<test>.out" plus numbered variants
+    # "<test>_1.out", "<test>_2.out", ... (e.g. wchar-char differs per client
+    # locale/encoding). A run passes if it matches ANY of these, mirroring the
+    # original runsuite's rundiff() behavior.
     expected_file="$ORIG_TEST_DIR/expected/${test_name}.out"
     if [ ! -f "$expected_file" ]; then
         echo "PASS: $test_name (no expected file to compare)"
@@ -183,7 +187,16 @@ for test_name in $TESTS; do
         continue
     fi
 
-    if diff -q "$expected_file" "$result_file" >/dev/null 2>&1; then
+    matched=""
+    for candidate in "$expected_file" "$ORIG_TEST_DIR/expected/${test_name}"_*.out; do
+        [ -f "$candidate" ] || continue
+        if diff -q "$candidate" "$result_file" >/dev/null 2>&1; then
+            matched="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$matched" ]; then
         echo "PASS: $test_name"
         PASS=$((PASS + 1))
     else

@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "parameter.h"
+#include "type_mapping.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -135,7 +136,7 @@ static char *encode_char_hex_as_bytea(const char *value, size_t value_length,
  * For numeric types: snprintf is used with appropriate format specifiers.
  * For SQL_C_BINARY: hex-encoded with PostgreSQL's bytea hex format (\x prefix).
  */
-static char *convert_parameter_to_text(const ParameterBinding *binding, int *out_length)
+char *convert_parameter_to_text(const ParameterBinding *binding, int *out_length)
 {
     /* Check for NULL indicator */
     if (binding->indicator_or_length) {
@@ -205,6 +206,42 @@ static char *convert_parameter_to_text(const ParameterBinding *binding, int *out
         return result;
     }
 
+    case SQL_C_WCHAR: {
+        /* The application buffer holds UTF-16 code units; PostgreSQL's client
+         * encoding is UTF-8, so transcode before binding. For SQL_C_WCHAR the
+         * indicator length is expressed in BYTES (not code units). */
+        const SQLWCHAR *wide_value = (const SQLWCHAR *)binding->value_buffer;
+        size_t unit_count;
+        if (binding->indicator_or_length) {
+            SQLLEN declared_length = *binding->indicator_or_length;
+            if (declared_length == SQL_NTS) {
+                unit_count = 0;
+                while (wide_value[unit_count] != 0) {
+                    unit_count++;
+                }
+            } else if (declared_length >= 0) {
+                unit_count = (size_t)declared_length / sizeof(SQLWCHAR);
+            } else {
+                unit_count = 0;
+                while (wide_value[unit_count] != 0) {
+                    unit_count++;
+                }
+            }
+        } else {
+            unit_count = 0;
+            while (wide_value[unit_count] != 0) {
+                unit_count++;
+            }
+        }
+
+        char *utf8_value = type_mapping_utf16le_to_utf8(wide_value, unit_count, out_length);
+        if (!utf8_value) {
+            *out_length = 0;
+            return NULL;
+        }
+        return utf8_value;
+    }
+
     case SQL_C_SLONG:
     case SQL_C_LONG:
         length = snprintf(conversion_buffer, sizeof(conversion_buffer),
@@ -265,6 +302,29 @@ static char *convert_parameter_to_text(const ParameterBinding *binding, int *out
         length = snprintf(conversion_buffer, sizeof(conversion_buffer),
                           "%u", (unsigned int)*(const uint8_t *)binding->value_buffer);
         break;
+
+    case SQL_C_NUMERIC: {
+        /* Unpack the SQL_NUMERIC_STRUCT back into decimal text so PostgreSQL can
+         * parse it as an exact numeric. NUMERIC_TEXT_BUFFER_SIZE is larger than
+         * NUMERIC_CONVERSION_BUFFER_SIZE (128-bit values with large scales exceed
+         * 64 bytes), so use a dedicated buffer here. */
+        char numeric_text[NUMERIC_TEXT_BUFFER_SIZE];
+        int numeric_length = type_mapping_format_numeric_text(
+            (const SQL_NUMERIC_STRUCT *)binding->value_buffer,
+            numeric_text, sizeof(numeric_text));
+        if (numeric_length < 0) {
+            *out_length = 0;
+            return NULL;
+        }
+        result = malloc((size_t)numeric_length + 1);
+        if (!result) {
+            *out_length = 0;
+            return NULL;
+        }
+        memcpy(result, numeric_text, (size_t)numeric_length + 1);
+        *out_length = numeric_length;
+        return result;
+    }
 
     case SQL_C_INTERVAL_YEAR:
     case SQL_C_INTERVAL_MONTH:
@@ -493,6 +553,9 @@ SQLRETURN parameter_bind(ParameterBinding *bindings,
     bindings[slot_index].buffer_length = buffer_length;
     bindings[slot_index].indicator_or_length = indicator_or_length;
     bindings[slot_index].is_bound = true;
+    /* Clear any parameter name from a previous binding of this slot. A name is
+     * (re)applied afterward via SQLSetDescField(IPD, SQL_DESC_NAME). */
+    bindings[slot_index].name[0] = '\0';
 
     if (!was_previously_bound) {
         (*bound_count)++;

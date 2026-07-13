@@ -75,4 +75,34 @@ SQLRETURN results_get_data(OdbcStatement *statement,
                            SQLLEN buffer_length,
                            SQLLEN *indicator_or_length);
 
+/*
+ * Advance to the next result set of a multi-statement query, making it the
+ * current result for subsequent SQLNumResultCols / SQLDescribeCol / SQLFetch.
+ *
+ * Returns SQL_SUCCESS (or SQL_SUCCESS_WITH_INFO) when a next result set becomes
+ * available, SQL_NO_DATA when there are no more result sets, and SQL_ERROR if
+ * the next result set reported an execution error.
+ */
+SQLRETURN results_more_results(OdbcStatement *statement);
+
+/*
+ * Convert a single value from an arbitrary PGresult cell into the requested
+ * ODBC C type and write it to target_value / indicator_or_length, using the
+ * same conversion rules as SQLGetData. Exposed so the statement module can copy
+ * procedure OUT/INOUT parameter values (which live in a call's result row) back
+ * into application buffers with correct type conversion.
+ *
+ * NULL cells set *indicator_or_length to SQL_NULL_DATA. target_type may be
+ * SQL_C_DEFAULT. Returns SQL_SUCCESS, SQL_SUCCESS_WITH_INFO (truncation), or
+ * SQL_ERROR.
+ */
+SQLRETURN results_convert_column(OdbcStatement *statement,
+                                 PGresult *result,
+                                 int row_index,
+                                 int column_index,
+                                 SQLSMALLINT target_type,
+                                 SQLPOINTER target_value,
+                                 SQLLEN buffer_length,
+                                 SQLLEN *indicator_or_length);
+
 #endif /* PSQLODBC2_RESULTS_H */

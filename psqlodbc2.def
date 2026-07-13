@@ -34,3 +34,13 @@ EXPORTS
     SQLGetInfo        @32
     SQLNumParams      @33
     SQLNativeSql      @34
+    SQLSetDescField   @35
+    SQLGetDescField   @36
+    SQLMoreResults    @37
+    SQLGetTypeInfo    @38
+    SQLColumnPrivileges @39
+    SQLTablePrivileges  @40
+    SQLStatistics       @41
+    SQLProcedures       @42
+    SQLProcedureColumns @43
+    SQLSpecialColumns   @44

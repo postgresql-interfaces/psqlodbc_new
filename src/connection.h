@@ -84,6 +84,22 @@ typedef struct ConnectionInfo {
     /* Maximum size (in characters) reported for varchar/char columns without a
      * declared length limit. Controlled by the "MaxVarcharSize" keyword. */
     int max_varchar_size;
+
+    /* When true (the "Parse" connection keyword), the driver parses SELECT
+     * statements client-side to refine result-column metadata — notably to
+     * report a string literal in the select list as VARCHAR(length) rather than
+     * relying solely on PostgreSQL's "text" type. Matches the original driver's
+     * Parse option used by MS Access. */
+    bool parse_statements;
+
+    /* When true (the "FetchRefcursors" connection keyword), a function/procedure
+     * that returns refcursor OUT parameters has each cursor automatically
+     * FETCH ALL'd and its rows exposed as successive result sets, walkable with
+     * SQLMoreResults. When false (the default), the refcursor OUT value is
+     * returned verbatim as its portal name. Because a refcursor is only valid
+     * inside the transaction that opened it, this option requires the call to
+     * run in a transaction (autocommit OFF), matching the original driver. */
+    bool fetch_refcursors;
 } ConnectionInfo;
 
 /* Values for ConnectionInfo.unknown_sizes, matching the original psqlodbc.
@@ -151,13 +167,31 @@ typedef struct OdbcConnection {
      * records with SQLSTATE "01000" (General warning). */
     char *captured_notices[MAX_CAPTURED_NOTICES];  /* heap-allocated strings */
     int notice_count;
+
+    /* MS Access / Jet compatibility mode, toggled by SQLSetConnectAttr with
+     * the driver-specific SQL_ATTR_PGOPT_MSJET (65549) attribute. Enables the
+     * ("col" = 1) -> ("col"='1') boolean rewrite in the query parser. */
+    bool ms_jet;
 } OdbcConnection;
+
+/* Driver-specific connection attribute (from the original psqlodbc's
+ * pgapifunc.h) that MS Access sets to request Jet-compatibility quirks. */
+#define SQL_ATTR_PGOPT_MSJET 65549
 
 /*
  * Clear all captured notices, freeing the heap-allocated message strings.
  * Called after notices have been promoted to diagnostic records on a statement.
  */
 void connection_clear_notices(OdbcConnection *connection);
+
+/*
+ * Return whether the server currently has standard_conforming_strings on.
+ * Read from libpq's tracked parameter status, which reflects any SET the
+ * application issued. Defaults to true (the modern PostgreSQL default) when
+ * the status is unavailable. Controls how the query parser treats backslashes
+ * inside ordinary '...' string literals.
+ */
+bool connection_standard_conforming_strings(const OdbcConnection *connection);
 
 /* ---- Public Interface ---- */
 

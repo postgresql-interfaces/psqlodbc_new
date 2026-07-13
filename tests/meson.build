@@ -98,6 +98,7 @@ test('catalog', test_catalog,
 test_parameter_binding = executable('test_parameter_binding',
     'test_parameter_binding.c',
     '../src/parameter.c',
+    '../src/type_mapping.c',
     include_directories : [inc, include_directories('../src')],
     dependencies : [odbc_dep, libpq_dep],
 )
