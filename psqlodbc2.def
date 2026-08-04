@@ -44,3 +44,8 @@ EXPORTS
     SQLProcedures       @42
     SQLProcedureColumns @43
     SQLSpecialColumns   @44
+    SQLFetchScroll      @45
+    SQLExtendedFetch    @46
+    SQLSetCursorName    @47
+    SQLGetCursorName    @48
+    SQLCloseCursor      @49

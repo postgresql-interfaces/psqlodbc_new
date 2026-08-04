@@ -100,7 +100,34 @@ typedef struct ConnectionInfo {
      * inside the transaction that opened it, this option requires the call to
      * run in a transaction (autocommit OFF), matching the original driver. */
     bool fetch_refcursors;
+
+    /* How the driver reacts when a statement errors inside an explicit
+     * (autocommit-OFF) transaction. Set from the "Protocol=7.4-N" connection
+     * keyword, where N is this value. See the ROLLBACK_ON_ERROR_* constants.
+     * A negative value means "not specified" — the driver then applies the
+     * server-appropriate default (statement-level rollback on modern servers).
+     * Matches the original psqlodbc's rollback_on_error option. */
+    int rollback_on_error;
 } ConnectionInfo;
+
+/* Values for ConnectionInfo.rollback_on_error, matching the original psqlodbc.
+ *   NOTHING:   leave the aborted transaction as-is; the application must issue
+ *              its own ROLLBACK (via SQLEndTran) before continuing.
+ *   TRANSACTION: automatically roll back the entire transaction on any error.
+ *   STATEMENT: roll back only the failed statement (via a per-statement
+ *              SAVEPOINT), preserving earlier successful work in the transaction.
+ * UNSPECIFIED (-1) selects the default resolved at runtime from the server
+ * version — STATEMENT on servers new enough to support SAVEPOINT. */
+#define ROLLBACK_ON_ERROR_UNSPECIFIED  (-1)
+#define ROLLBACK_ON_ERROR_NOTHING       0
+#define ROLLBACK_ON_ERROR_TRANSACTION   1
+#define ROLLBACK_ON_ERROR_STATEMENT     2
+
+/* Name of the internal SAVEPOINT used to implement statement-level error
+ * rollback (rollback_on_error == STATEMENT). One savepoint is (re)established
+ * before each statement and rolled back to if that statement fails, so a single
+ * fixed name suffices. */
+#define PER_STATEMENT_SAVEPOINT_NAME "_psqlodbc2_stmt_svp_"
 
 /* Values for ConnectionInfo.unknown_sizes, matching the original psqlodbc.
  * MAX:     report the driver's configured maximum size for the type.
@@ -157,6 +184,13 @@ typedef struct OdbcConnection {
 
     /* Transaction management */
     TransactionState transaction_state;
+
+    /* True when an internal per-statement SAVEPOINT is currently established
+     * inside the active transaction (statement-level error rollback, i.e.
+     * rollback_on_error == STATEMENT). Reset whenever the transaction ends.
+     * Used to decide whether the next statement must RELEASE-and-recreate the
+     * savepoint versus create it for the first time. */
+    bool statement_savepoint_active;
     SQLUINTEGER txn_isolation;       /* SQL_TXN_READ_COMMITTED, SQL_TXN_SERIALIZABLE, etc. */
     SQLUINTEGER login_timeout;       /* Seconds; applied at connect time via connect_timeout */
     SQLUINTEGER connection_timeout;  /* Seconds; 0 = no timeout (informational only for PG) */
@@ -278,5 +312,35 @@ SQLRETURN connection_rollback(OdbcConnection *connection);
  * Returns SQL_SUCCESS on success, SQL_ERROR if BEGIN fails.
  */
 SQLRETURN connection_ensure_transaction(OdbcConnection *connection);
+
+/*
+ * Resolve the effective rollback-on-error mode for this connection.
+ * Returns the ConnectionInfo.rollback_on_error value when the application set
+ * one explicitly; otherwise returns the server-appropriate default
+ * (ROLLBACK_ON_ERROR_STATEMENT on modern servers that support SAVEPOINT).
+ */
+int connection_effective_rollback_on_error(const OdbcConnection *connection);
+
+/*
+ * Establish the per-statement SAVEPOINT before executing a statement, when the
+ * connection is configured for statement-level error rollback and a transaction
+ * is active. If a savepoint from the previous statement is still standing, it is
+ * released and re-created so it always marks the point just before this
+ * statement. A no-op for other rollback modes, autocommit-ON, or when no
+ * transaction is active yet. Errors here are non-fatal and left unreported —
+ * the statement still executes.
+ */
+void connection_begin_statement_savepoint(OdbcConnection *connection);
+
+/*
+ * React to a statement failure according to the rollback-on-error mode:
+ *   STATEMENT   - roll back to the per-statement SAVEPOINT, undoing only the
+ *                 failed statement and clearing the transaction's FAILED state
+ *                 so subsequent statements can run.
+ *   TRANSACTION - roll back the entire transaction.
+ *   NOTHING     - leave the transaction aborted for the application to handle.
+ * Called after a statement execution reports an error while autocommit is OFF.
+ */
+void connection_handle_statement_error(OdbcConnection *connection);
 
 #endif /* PSQLODBC2_CONNECTION_H */

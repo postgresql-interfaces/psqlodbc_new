@@ -125,6 +125,25 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
          * keyword is accepted (and ignored) for connection-string compatibility
          * with applications and tests that set it. */
 
+    } else if (case_insensitive_compare(key, "UseDeclareFetch") == 0) {
+        /* The original driver uses a server-side DECLARE/FETCH cursor to stream
+         * large result sets in chunks. This modern driver always materializes
+         * the whole result set client-side (which inherently survives a mid-fetch
+         * COMMIT), so the option needs no distinct code path; it is accepted for
+         * connection-string compatibility with applications and tests that set it. */
+
+    } else if (case_insensitive_compare(key, "Protocol") == 0) {
+        /* The historical "Protocol" keyword has the form "7.4-N", where the
+         * trailing N selects the error-rollback behavior (rollback_on_error).
+         * The "7.4" prefix is a legacy wire-protocol label with no effect on a
+         * modern libpq connection, so only the "-N" suffix is meaningful. */
+        char protocol_buffer[32];
+        safe_copy_to_buffer(protocol_buffer, sizeof(protocol_buffer), value, value_length);
+        const char *dash = strrchr(protocol_buffer, '-');
+        if (dash && dash[1] != '\0') {
+            info->rollback_on_error = (int)strtol(dash + 1, NULL, 10);
+        }
+
     } else if (case_insensitive_compare(key, "DisallowPremature") == 0) {
         /* Accepted for compatibility with the original driver; the modern
          * implementation always describes results after execution, so there is

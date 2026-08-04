@@ -59,6 +59,37 @@ SQLRETURN results_row_count(OdbcStatement *statement, SQLLEN *row_count);
 SQLRETURN results_fetch(OdbcStatement *statement);
 
 /*
+ * Reposition the cursor within the client-side result buffer according to an
+ * ODBC fetch orientation, then copy the landed row into bound columns (exactly
+ * as results_fetch does). Backs both SQLFetchScroll and SQLExtendedFetch.
+ *
+ * Supported orientations: SQL_FETCH_NEXT, SQL_FETCH_PRIOR, SQL_FETCH_FIRST,
+ * SQL_FETCH_LAST, SQL_FETCH_ABSOLUTE, SQL_FETCH_RELATIVE. For ABSOLUTE and
+ * RELATIVE the fetch_offset argument selects the target row (1-based for
+ * ABSOLUTE, signed delta for RELATIVE); it is ignored for the others.
+ *
+ * Cursor position model (statement->current_row_position):
+ *   -1            = before the first row (BOF)
+ *   0 .. N-1      = a valid row
+ *   N (row count) = past the last row (EOF)
+ *
+ * Forward-only cursors (cursor_type == SQL_CURSOR_FORWARD_ONLY) accept only
+ * SQL_FETCH_NEXT; any other orientation is rejected with SQLSTATE HY106.
+ *
+ * The optional out-parameters exist for SQLExtendedFetch (SQLFetchScroll passes
+ * NULL): fetched_row_count receives 1 when a row was returned or 0 on
+ * SQL_NO_DATA; row_status_array[0] receives the per-row status.
+ *
+ * Returns SQL_SUCCESS, SQL_SUCCESS_WITH_INFO (e.g. a backward fetch clamped to
+ * the first row, SQLSTATE 01S06), SQL_NO_DATA at BOF/EOF, or SQL_ERROR.
+ */
+SQLRETURN results_extended_fetch(OdbcStatement *statement,
+                                 SQLUSMALLINT fetch_orientation,
+                                 SQLLEN fetch_offset,
+                                 SQLULEN *fetched_row_count,
+                                 SQLUSMALLINT *row_status_array);
+
+/*
  * Retrieve data for a single column from the current row.
  * Column numbers are 1-based. The value is converted from PostgreSQL's text
  * representation to the requested target C type.

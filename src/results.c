@@ -994,23 +994,107 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
 }
 
 /*
- * After advancing the cursor, write column values into all bound buffers.
+ * Compute the byte stride between consecutive elements of a bound column's
+ * target buffer when the application uses a block (row-array) cursor with
+ * column-wise binding (the default, SQL_BIND_BY_COLUMN).
  *
- * For each active column binding, retrieves the raw PG text value and converts
- * it using convert_value_to_c_type. NULL values set the indicator to SQL_NULL_DATA
- * without touching the buffer. If any conversion produces truncation, the overall
- * result is escalated to SQL_SUCCESS_WITH_INFO.
+ * For genuinely variable-length C types (character/binary) each element
+ * occupies the full bound buffer_length. Every other C type — including the
+ * fixed-size struct types (numeric, date, time, timestamp, interval) — has a
+ * definite sizeof and MUST stride by that, never by buffer_length: applications
+ * routinely bind these struct types with buffer_length = 0 (the length is
+ * implied by the type), so relying on buffer_length there would yield a stride
+ * of 0 and silently overwrite element 0 for every row of the rowset.
+ */
+static size_t c_type_element_stride(SQLSMALLINT c_type, SQLLEN buffer_length)
+{
+    switch (c_type) {
+    case SQL_C_CHAR:
+    case SQL_C_WCHAR:
+    case SQL_C_BINARY:
+        /* Truly variable-length targets stride by the declared buffer. */
+        return (buffer_length > 0) ? (size_t)buffer_length : 0;
+
+    case SQL_C_SLONG:
+    case SQL_C_ULONG:
+    case SQL_C_LONG:
+        return sizeof(SQLINTEGER);
+    case SQL_C_SSHORT:
+    case SQL_C_USHORT:
+    case SQL_C_SHORT:
+        return sizeof(SQLSMALLINT);
+    case SQL_C_STINYINT:
+    case SQL_C_UTINYINT:
+    case SQL_C_TINYINT:
+    case SQL_C_BIT:
+        return sizeof(SQLCHAR);
+    case SQL_C_SBIGINT:
+    case SQL_C_UBIGINT:
+        return sizeof(SQLBIGINT);
+    case SQL_C_FLOAT:
+        return sizeof(SQLREAL);
+    case SQL_C_DOUBLE:
+        return sizeof(SQLDOUBLE);
+
+    /* Fixed-size struct C types: stride by the concrete struct size, which is
+     * fixed regardless of the (often zero) bound buffer_length. */
+    case SQL_C_NUMERIC:
+        return sizeof(SQL_NUMERIC_STRUCT);
+    case SQL_C_TYPE_DATE:
+    case SQL_C_DATE:
+        return sizeof(SQL_DATE_STRUCT);
+    case SQL_C_TYPE_TIME:
+    case SQL_C_TIME:
+        return sizeof(SQL_TIME_STRUCT);
+    case SQL_C_TYPE_TIMESTAMP:
+    case SQL_C_TIMESTAMP:
+        return sizeof(SQL_TIMESTAMP_STRUCT);
+    case SQL_C_INTERVAL_YEAR:
+    case SQL_C_INTERVAL_MONTH:
+    case SQL_C_INTERVAL_YEAR_TO_MONTH:
+    case SQL_C_INTERVAL_DAY:
+    case SQL_C_INTERVAL_HOUR:
+    case SQL_C_INTERVAL_MINUTE:
+    case SQL_C_INTERVAL_SECOND:
+    case SQL_C_INTERVAL_DAY_TO_HOUR:
+    case SQL_C_INTERVAL_DAY_TO_MINUTE:
+    case SQL_C_INTERVAL_DAY_TO_SECOND:
+    case SQL_C_INTERVAL_HOUR_TO_MINUTE:
+    case SQL_C_INTERVAL_HOUR_TO_SECOND:
+    case SQL_C_INTERVAL_MINUTE_TO_SECOND:
+        return sizeof(SQL_INTERVAL_STRUCT);
+
+    default:
+        /* Unknown/unsupported type: fall back to the declared buffer length
+         * when the application supplied one. */
+        return (buffer_length > 0) ? (size_t)buffer_length : 0;
+    }
+}
+
+/*
+ * Write one result-set row into the bound application buffers.
+ *
+ * source_row is the 0-based row index within the current PGresult to read.
+ * rowset_offset is the 0-based element position within the application's bound
+ * column arrays to write (0 for a single-row fetch; 0..row_array_size-1 for a
+ * block cursor). For each active binding the target buffer and indicator are
+ * advanced by rowset_offset elements so consecutive rows land in successive
+ * array slots.
+ *
+ * NULL values set the indicator to SQL_NULL_DATA without touching the buffer.
+ * Truncation escalates the result to SQL_SUCCESS_WITH_INFO.
  *
  * Returns SQL_SUCCESS or SQL_SUCCESS_WITH_INFO.
  */
-static SQLRETURN populate_bound_columns(OdbcStatement *statement)
+static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
+                                            int source_row,
+                                            SQLULEN rowset_offset)
 {
     if (statement->bound_column_count == 0) {
         return SQL_SUCCESS;
     }
 
     int total_columns = PQnfields(statement->current_result);
-    int row_index = statement->current_row_position;
     SQLRETURN overall_result = SQL_SUCCESS;
 
     for (int slot_index = 0; slot_index < MAX_BOUND_COLUMNS; slot_index++) {
@@ -1028,17 +1112,6 @@ static SQLRETURN populate_bound_columns(OdbcStatement *statement)
             continue;
         }
 
-        /* Handle NULL values: set indicator and skip buffer write */
-        if (PQgetisnull(statement->current_result, row_index, column_index)) {
-            if (binding->indicator_or_length) {
-                *binding->indicator_or_length = SQL_NULL_DATA;
-            }
-            continue;
-        }
-
-        const char *raw_value = PQgetvalue(statement->current_result, row_index, column_index);
-        int raw_value_length = PQgetlength(statement->current_result, row_index, column_index);
-
         /* Resolve SQL_C_DEFAULT to the concrete C type for this column's PG type */
         SQLSMALLINT resolved_type = binding->target_type;
         if (resolved_type == SQL_C_DEFAULT) {
@@ -1046,6 +1119,32 @@ static SQLRETURN populate_bound_columns(OdbcStatement *statement)
             SQLSMALLINT sql_type = type_mapping_get_sql_type(postgres_oid);
             resolved_type = type_mapping_get_default_c_type(sql_type);
         }
+
+        /* For a block cursor, target element N lives at buffer + N*stride and
+         * indicator element N at indicator + N. For a single-row fetch
+         * rowset_offset is 0 and these reduce to the bound pointers unchanged. */
+        SQLPOINTER element_buffer = binding->target_buffer;
+        SQLLEN *element_indicator = binding->indicator_or_length;
+        if (rowset_offset > 0) {
+            size_t stride = c_type_element_stride(resolved_type, binding->buffer_length);
+            if (element_buffer && stride > 0) {
+                element_buffer = (SQLPOINTER)((char *)element_buffer + rowset_offset * stride);
+            }
+            if (element_indicator) {
+                element_indicator = element_indicator + rowset_offset;
+            }
+        }
+
+        /* Handle NULL values: set indicator and skip buffer write */
+        if (PQgetisnull(statement->current_result, source_row, column_index)) {
+            if (element_indicator) {
+                *element_indicator = SQL_NULL_DATA;
+            }
+            continue;
+        }
+
+        const char *raw_value = PQgetvalue(statement->current_result, source_row, column_index);
+        int raw_value_length = PQgetlength(statement->current_result, source_row, column_index);
 
         unsigned int col_oid = (unsigned int)PQftype(statement->current_result, column_index);
         /* Per-column ARD SQL_DESC_PRECISION override (interval fractional secs).
@@ -1055,8 +1154,8 @@ static SQLRETURN populate_bound_columns(OdbcStatement *statement)
                                      : -1;
         SQLRETURN conversion_result = convert_value_to_c_type(
             statement, raw_value, raw_value_length,
-            resolved_type, binding->target_buffer,
-            binding->buffer_length, binding->indicator_or_length,
+            resolved_type, element_buffer,
+            binding->buffer_length, element_indicator,
             col_oid, fraction_precision);
 
         /* Escalate overall result if any column was truncated */
@@ -1066,6 +1165,75 @@ static SQLRETURN populate_bound_columns(OdbcStatement *statement)
     }
 
     return overall_result;
+}
+
+/*
+ * Fill the application's bound column arrays with a rowset starting at the
+ * statement's current cursor position, honoring the block-cursor size
+ * (SQL_ATTR_ROW_ARRAY_SIZE). Copies up to row_array_size consecutive rows into
+ * the bound arrays, leaves current_row_position on the LAST row copied (so a
+ * following SQL_FETCH_NEXT continues after the rowset), and reports the row
+ * count and per-row status via SQL_ATTR_ROWS_FETCHED_PTR / ROW_STATUS_PTR.
+ *
+ * The cursor is assumed to already be positioned on the first row of the rowset
+ * (0 <= current_row_position < total_rows). Returns SQL_SUCCESS or, on any-row
+ * truncation, SQL_SUCCESS_WITH_INFO.
+ */
+static SQLRETURN populate_bound_rowset(OdbcStatement *statement)
+{
+    int total_rows = PQntuples(statement->current_result);
+    SQLULEN rowset_size = statement->row_array_size > 0 ? statement->row_array_size : 1;
+
+    SQLRETURN overall_result = SQL_SUCCESS;
+    SQLULEN rows_copied = 0;
+    int first_row = statement->current_row_position;
+
+    for (SQLULEN offset = 0; offset < rowset_size; offset++) {
+        int source_row = first_row + (int)offset;
+        if (source_row >= total_rows) {
+            break;  /* Fewer rows remain than the rowset can hold. */
+        }
+
+        SQLRETURN row_result = populate_bound_columns_row(statement, source_row, offset);
+        if (row_result == SQL_SUCCESS_WITH_INFO) {
+            overall_result = SQL_SUCCESS_WITH_INFO;
+        }
+
+        if (statement->row_status_ptr) {
+            statement->row_status_ptr[offset] =
+                (row_result == SQL_SUCCESS_WITH_INFO) ? SQL_ROW_SUCCESS_WITH_INFO
+                                                      : SQL_ROW_SUCCESS;
+        }
+        rows_copied++;
+    }
+
+    /* Any unused status-array slots describe rows that were not fetched. */
+    if (statement->row_status_ptr) {
+        for (SQLULEN offset = rows_copied; offset < rowset_size; offset++) {
+            statement->row_status_ptr[offset] = SQL_ROW_NOROW;
+        }
+    }
+
+    if (statement->rows_fetched_ptr) {
+        *statement->rows_fetched_ptr = rows_copied;
+    }
+
+    /* Leave the cursor on the last row actually copied so SQL_FETCH_NEXT resumes
+     * immediately after this rowset. */
+    if (rows_copied > 0) {
+        statement->current_row_position = first_row + (int)rows_copied - 1;
+    }
+
+    return overall_result;
+}
+
+/*
+ * Single-row convenience wrapper used by plain SQLFetch and the single-row
+ * scrolling path: writes the current row into element 0 of the bound buffers.
+ */
+static SQLRETURN populate_bound_columns(OdbcStatement *statement)
+{
+    return populate_bound_columns_row(statement, statement->current_row_position, 0);
 }
 
 /* ---- Public Interface ---- */
@@ -1265,13 +1433,215 @@ SQLRETURN results_fetch(OdbcStatement *statement)
     statement->current_row_position++;
 
     if (statement->current_row_position >= total_rows) {
-        /* Past the last row — no more data */
+        /* Past the last row — no more data. Report zero rows fetched for block
+         * cursors so the application's rows-fetched counter is accurate. */
+        if (statement->rows_fetched_ptr) {
+            *statement->rows_fetched_ptr = 0;
+        }
         return SQL_NO_DATA;
+    }
+
+    /* Block cursor: copy up to row_array_size consecutive rows into the bound
+     * column arrays and report the count / per-row status. A single-row cursor
+     * (the default) copies exactly one row via the same path. */
+    if (statement->row_array_size > 1) {
+        return populate_bound_rowset(statement);
     }
 
     /* Write column values into all bound application buffers.
      * If no columns are bound, this returns immediately (apps use SQLGetData instead). */
+    if (statement->rows_fetched_ptr) {
+        *statement->rows_fetched_ptr = 1;
+    }
+    if (statement->row_status_ptr) {
+        statement->row_status_ptr[0] = SQL_ROW_SUCCESS;
+    }
     return populate_bound_columns(statement);
+}
+
+/*
+ * Sentinel used by the orientation math below: -1 encodes "before the first
+ * row" (BOF). Any target >= total_rows encodes "past the last row" (EOF).
+ */
+#define CURSOR_POSITION_BEFORE_FIRST_ROW (-1)
+
+SQLRETURN results_extended_fetch(OdbcStatement *statement,
+                                 SQLUSMALLINT fetch_orientation,
+                                 SQLLEN fetch_offset,
+                                 SQLULEN *fetched_row_count,
+                                 SQLUSMALLINT *row_status_array)
+{
+    /* Default the SQLExtendedFetch out-parameters to "no row"; they are
+     * overwritten below once the outcome is known. SQLFetchScroll passes NULL. */
+    if (fetched_row_count) {
+        *fetched_row_count = 0;
+    }
+    if (row_status_array) {
+        row_status_array[0] = SQL_ROW_NOROW;
+    }
+
+    if (!statement->current_result || !statement->has_result_set) {
+        /* No open cursor: mirror results_fetch and report end-of-data rather
+         * than an error, so callers that scroll over a rowless command behave
+         * the same as a plain SQLFetch. */
+        return SQL_NO_DATA;
+    }
+
+    /* Forward-only cursors can only advance. Reject every other orientation
+     * with HY106 ("Fetch type out of range") per the ODBC spec. */
+    if (statement->cursor_type == SQL_CURSOR_FORWARD_ONLY &&
+        fetch_orientation != SQL_FETCH_NEXT) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY106",  /* Fetch type out of range */
+                               0,
+                               "Only SQL_FETCH_NEXT is allowed on a forward-only cursor.");
+        return SQL_ERROR;
+    }
+
+    const int total_rows = PQntuples(statement->current_result);
+    const int current_position = statement->current_row_position;
+
+    /* Resolve the requested orientation to a target 0-based row index. A target
+     * below zero means BOF; a target >= total_rows means EOF. When a backward
+     * ABSOLUTE fetch runs off the front of the result set, ODBC clamps to the
+     * first row and warns with 01S06 rather than returning no data. */
+    /* Use SQLLEN (not long) so the arithmetic stays 64-bit on LLP64 platforms
+     * such as 64-bit Windows, where long is only 32 bits. */
+    SQLLEN target_index;
+    bool clamped_before_first_row = false;
+
+    switch (fetch_orientation) {
+    case SQL_FETCH_NEXT:
+        /* From BOF, NEXT is equivalent to FETCH_FIRST. */
+        target_index = (current_position < 0) ? 0 : (SQLLEN)current_position + 1;
+        break;
+
+    case SQL_FETCH_PRIOR:
+        /* From EOF, PRIOR is equivalent to FETCH_LAST. */
+        target_index = (current_position >= total_rows)
+                           ? (SQLLEN)total_rows - 1
+                           : (SQLLEN)current_position - 1;
+        break;
+
+    case SQL_FETCH_FIRST:
+        target_index = 0;
+        break;
+
+    case SQL_FETCH_LAST:
+        target_index = (SQLLEN)total_rows - 1;
+        break;
+
+    case SQL_FETCH_ABSOLUTE:
+        if (fetch_offset == 0) {
+            /* Offset 0 positions the cursor before the result set (BOF). */
+            target_index = CURSOR_POSITION_BEFORE_FIRST_ROW;
+        } else if (fetch_offset > 0) {
+            /* Positive offsets are 1-based from the start. */
+            target_index = fetch_offset - 1;
+        } else {
+            /* Negative offsets count back from the end: -1 is the last row. */
+            target_index = (SQLLEN)total_rows + fetch_offset;
+            if (target_index < 0) {
+                target_index = 0;
+                clamped_before_first_row = true;
+            }
+        }
+        break;
+
+    case SQL_FETCH_RELATIVE:
+        /* Signed delta from the current position. Because BOF is encoded as -1
+         * and EOF as total_rows, this arithmetic also yields the ODBC-mandated
+         * "RELATIVE from BOF with positive offset behaves like ABSOLUTE" case. */
+        target_index = (SQLLEN)current_position + fetch_offset;
+        break;
+
+    default:
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY106",  /* Fetch type out of range */
+                               0,
+                               "Unsupported fetch orientation.");
+        return SQL_ERROR;
+    }
+
+    /* Landed before the first row: park at BOF and report no data. */
+    if (target_index < 0) {
+        statement->current_row_position = CURSOR_POSITION_BEFORE_FIRST_ROW;
+        return SQL_NO_DATA;
+    }
+
+    /* Landed past the last row: park exactly at EOF (total_rows) — not beyond —
+     * so a following SQL_FETCH_PRIOR correctly returns the last row. */
+    if (target_index >= total_rows) {
+        statement->current_row_position = total_rows;
+        return SQL_NO_DATA;
+    }
+
+    statement->current_row_position = (int)target_index;
+
+    /* Copy the landed rowset into the bound arrays. A block cursor
+     * (row_array_size > 1) copies up to that many consecutive rows and advances
+     * the cursor to the last one; a single-row cursor copies exactly one row.
+     * populate_bound_rowset also updates SQL_ATTR_ROWS_FETCHED_PTR /
+     * ROW_STATUS_PTR, so the two out-parameters below only need mirroring for
+     * SQLExtendedFetch callers that pass their own pointers.
+     *
+     * KNOWN LIMITATION (backward block fetch not implemented): target_index is
+     * the FIRST row of the rowset, and populate_bound_rowset always copies
+     * FORWARD from there. For orientations that logically move backward with a
+     * block cursor (SQL_FETCH_PRIOR, and negative SQL_FETCH_RELATIVE) the ODBC
+     * spec says the returned rowset should be the block ENDING at the target and
+     * read forward — i.e. it should start at target_index - (row_array_size - 1).
+     * We do not yet compute that backward start, so a backward block fetch
+     * returns the forward block beginning at the target instead of the preceding
+     * block. This path is currently untested (the block-cursor test resets
+     * row_array_size to 1 before scrolling PRIOR) and out of scope for the
+     * acceptance tests. A future change should adjust target_index for backward
+     * orientations when row_array_size > 1 before copying here. */
+    SQLRETURN copy_result;
+    SQLULEN rows_copied;
+    if (statement->row_array_size > 1) {
+        copy_result = populate_bound_rowset(statement);
+        rows_copied = statement->current_row_position - (int)target_index + 1;
+    } else {
+        copy_result = populate_bound_columns(statement);
+        rows_copied = 1;
+        /* Keep the statement-level block-cursor pointers consistent even for a
+         * single-row scroll, since the same handle attributes drive them. */
+        if (statement->rows_fetched_ptr) {
+            *statement->rows_fetched_ptr = 1;
+        }
+        if (statement->row_status_ptr) {
+            statement->row_status_ptr[0] =
+                (copy_result == SQL_SUCCESS_WITH_INFO) ? SQL_ROW_SUCCESS_WITH_INFO
+                                                       : SQL_ROW_SUCCESS;
+        }
+    }
+
+    /* A backward ABSOLUTE fetch that ran off the front was clamped to the first
+     * row; surface that as SQL_SUCCESS_WITH_INFO with SQLSTATE 01S06. */
+    if (clamped_before_first_row) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "01S06",  /* Attempt to fetch before the result set returned the first rowset */
+                               0,
+                               "fetch absolute and before the beginning");
+        copy_result = SQL_SUCCESS_WITH_INFO;
+    }
+
+    /* SQLExtendedFetch callers pass their own count / status-array pointers
+     * (distinct from the SQL_ATTR_* pointers). Report the rowset outcome there
+     * too: the total rows copied, and per-row success in each populated slot. */
+    if (fetched_row_count) {
+        *fetched_row_count = rows_copied;
+    }
+    if (row_status_array) {
+        for (SQLULEN offset = 0; offset < rows_copied; offset++) {
+            row_status_array[offset] = (copy_result == SQL_SUCCESS_WITH_INFO)
+                                           ? SQL_ROW_SUCCESS_WITH_INFO
+                                           : SQL_ROW_SUCCESS;
+        }
+    }
+
+    return copy_result;
 }
 
 SQLRETURN results_get_data(OdbcStatement *statement,

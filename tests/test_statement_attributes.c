@@ -163,7 +163,10 @@ static int test_cursor_type_dynamic_downgrade(void)
     SQLHANDLE env, conn, stmt;
     if (setup_statement(&env, &conn, &stmt) != 0) return 1;
 
-    /* Set DYNAMIC — should return SQL_SUCCESS_WITH_INFO and store FORWARD_ONLY */
+    /* Set DYNAMIC — should return SQL_SUCCESS_WITH_INFO and store STATIC.
+     * The driver buffers the whole result set client-side, so it downgrades the
+     * unsupported keyset/dynamic cursor types to STATIC (which is scrollable and
+     * served from that buffer) rather than to FORWARD_ONLY. */
     SQLRETURN result = fn_set_stmt_attr(stmt, SQL_ATTR_CURSOR_TYPE,
                                         (SQLPOINTER)(uintptr_t)SQL_CURSOR_DYNAMIC, 0);
     if (result != SQL_SUCCESS_WITH_INFO) {
@@ -186,11 +189,12 @@ static int test_cursor_type_dynamic_downgrade(void)
         return 1;
     }
 
-    /* Get should return FORWARD_ONLY */
-    SQLULEN cursor_type = 99;
+    /* Get should return STATIC. SQL_ATTR_CURSOR_TYPE is a 32-bit SQLUINTEGER
+     * value, so read it into a matching-width variable. */
+    SQLUINTEGER cursor_type = 99;
     result = fn_get_stmt_attr(stmt, SQL_ATTR_CURSOR_TYPE, &cursor_type, 0, NULL);
-    if (result != SQL_SUCCESS || cursor_type != SQL_CURSOR_FORWARD_ONLY) {
-        fprintf(stderr, "    FAIL: after DYNAMIC downgrade, expected FORWARD_ONLY, got %lu\n",
+    if (result != SQL_SUCCESS || cursor_type != SQL_CURSOR_STATIC) {
+        fprintf(stderr, "    FAIL: after DYNAMIC downgrade, expected STATIC, got %lu\n",
                 (unsigned long)cursor_type);
         teardown_statement(env, conn, stmt);
         return 1;

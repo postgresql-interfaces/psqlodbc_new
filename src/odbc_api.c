@@ -450,6 +450,11 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         SQL_API_SQLPROCEDURES,
         SQL_API_SQLPROCEDURECOLUMNS,
         SQL_API_SQLSPECIALCOLUMNS,
+        SQL_API_SQLFETCHSCROLL,
+        SQL_API_SQLEXTENDEDFETCH,
+        SQL_API_SQLSETCURSORNAME,
+        SQL_API_SQLGETCURSORNAME,
+        SQL_API_SQLCLOSECURSOR,
     };
     int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
 
@@ -1081,6 +1086,264 @@ SQLFetch(SQLHSTMT statement_handle)
     diagnostics_clear(&statement->diagnostics);
 
     return results_fetch(statement);
+}
+
+/**
+ * SQLFetchScroll — Position the cursor within the result set and fetch the row.
+ *
+ * Moves the cursor according to fetch_orientation (optionally using
+ * fetch_offset for SQL_FETCH_ABSOLUTE / SQL_FETCH_RELATIVE) and copies the
+ * landed row into any bound columns. This driver buffers the whole result set
+ * client-side, so all orientations are served from that buffer. Forward-only
+ * cursors accept only SQL_FETCH_NEXT (others yield SQLSTATE HY106).
+ *
+ * Parameters:
+ *   statement_handle  - A valid statement handle with a result set.
+ *   fetch_orientation - SQL_FETCH_NEXT/PRIOR/FIRST/LAST/ABSOLUTE/RELATIVE.
+ *   fetch_offset      - Row offset for ABSOLUTE (1-based) and RELATIVE (signed).
+ *
+ * Returns:
+ *   SQL_SUCCESS / SQL_SUCCESS_WITH_INFO - a row was fetched.
+ *   SQL_NO_DATA        - the cursor moved before the first or past the last row.
+ *   SQL_ERROR          - no result set or an invalid orientation.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlfetchscroll-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLFetchScroll(SQLHSTMT     statement_handle,
+               SQLSMALLINT  fetch_orientation,
+               SQLLEN       fetch_offset)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return results_extended_fetch(statement,
+                                  (SQLUSMALLINT)fetch_orientation,
+                                  fetch_offset,
+                                  NULL,   /* SQLFetchScroll has no row-count out-param */
+                                  NULL);  /* nor a row-status array */
+}
+
+/**
+ * SQLExtendedFetch — Legacy (ODBC 2.x) scrollable fetch.
+ *
+ * Behaves like SQLFetchScroll but additionally reports the number of rows
+ * fetched and a per-row status array. Since this driver fetches a single row
+ * per call, row_count_ptr receives 0 or 1 and only row_status_array[0] is set.
+ * Backed by the same orientation engine as SQLFetchScroll.
+ *
+ * Parameters:
+ *   statement_handle  - A valid statement handle with a result set.
+ *   fetch_orientation - SQL_FETCH_NEXT/PRIOR/FIRST/LAST/ABSOLUTE/RELATIVE.
+ *   fetch_offset      - Row offset for ABSOLUTE (1-based) and RELATIVE (signed).
+ *   row_count_ptr     - Output: number of rows fetched (0 or 1). May be NULL.
+ *   row_status_array  - Output: status of the fetched row in element [0]. May be NULL.
+ *
+ * Returns:
+ *   SQL_SUCCESS / SQL_SUCCESS_WITH_INFO - a row was fetched.
+ *   SQL_NO_DATA        - the cursor moved before the first or past the last row.
+ *   SQL_ERROR          - no result set or an invalid orientation.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlextendedfetch-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLExtendedFetch(SQLHSTMT      statement_handle,
+                 SQLUSMALLINT  fetch_orientation,
+                 SQLLEN        fetch_offset,
+                 SQLULEN      *row_count_ptr,
+                 SQLUSMALLINT *row_status_array)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return results_extended_fetch(statement,
+                                  fetch_orientation,
+                                  fetch_offset,
+                                  row_count_ptr,
+                                  row_status_array);
+}
+
+/**
+ * SQLSetCursorName — Associate an application-chosen name with a statement's cursor.
+ *
+ * The name can later be used in positioned UPDATE/DELETE statements
+ * ("... WHERE CURRENT OF <name>"). It must not exceed the driver's cursor-name
+ * limit (SQLGetInfo(SQL_MAX_CURSOR_NAME_LEN)); an over-length name is rejected
+ * with SQLSTATE 34000. A name cannot be set while a cursor is open on the
+ * statement (SQLSTATE 24000).
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle.
+ *   cursor_name      - The cursor name to assign.
+ *   name_length      - Length of cursor_name in bytes, or SQL_NTS.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - The cursor name was set.
+ *   SQL_ERROR          - Name too long (34000), cursor open (24000), or invalid input.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetcursorname-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSetCursorName(SQLHSTMT    statement_handle,
+                 SQLCHAR    *cursor_name,
+                 SQLSMALLINT name_length)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    if (!cursor_name) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY009",  /* Invalid use of null pointer */
+                               0,
+                               "Cursor name pointer is NULL.");
+        return SQL_ERROR;
+    }
+
+    /* A cursor name may only be set before a result set is open on the
+     * statement — once a cursor is positioned, its name is fixed. */
+    if (statement->state == STATEMENT_STATE_HAS_CURSOR) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "24000",  /* Invalid cursor state */
+                               0,
+                               "Cannot set the cursor name while a cursor is open.");
+        return SQL_ERROR;
+    }
+
+    size_t actual_length = resolve_sql_string_length(cursor_name, name_length);
+
+    /* Reject names longer than the advertised SQL_MAX_CURSOR_NAME_LEN. */
+    if (actual_length > MAX_CURSOR_NAME_LENGTH) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "34000",  /* Invalid cursor name */
+                               0,
+                               "Cursor name exceeds SQL_MAX_CURSOR_NAME_LEN.");
+        return SQL_ERROR;
+    }
+
+    memcpy(statement->cursor_name, cursor_name, actual_length);
+    statement->cursor_name[actual_length] = '\0';
+    return SQL_SUCCESS;
+}
+
+/**
+ * SQLGetCursorName — Retrieve the name associated with a statement's cursor.
+ *
+ * Returns the name previously set by SQLSetCursorName. If none was set, the
+ * driver generates a unique implementation-defined name beginning with the
+ * "SQL_CUR" prefix (as recommended by the ODBC spec), stores it on the
+ * statement so subsequent calls are stable, and returns that. Standard string
+ * output truncation applies: if the buffer is too small the name is truncated,
+ * the full length is reported, and SQL_SUCCESS_WITH_INFO (SQLSTATE 01004) is
+ * returned.
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle.
+ *   cursor_name      - Output buffer for the cursor name.
+ *   buffer_length    - Size of cursor_name in bytes.
+ *   name_length_ptr  - Output: the full byte length of the name (excluding NUL).
+ *
+ * Returns:
+ *   SQL_SUCCESS           - Name returned in full.
+ *   SQL_SUCCESS_WITH_INFO - Name truncated to fit the buffer (SQLSTATE 01004).
+ *   SQL_INVALID_HANDLE    - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetcursorname-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetCursorName(SQLHSTMT     statement_handle,
+                 SQLCHAR     *cursor_name,
+                 SQLSMALLINT  buffer_length,
+                 SQLSMALLINT *name_length_ptr)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    /* No explicit name set yet: auto-generate one. The statement pointer makes
+     * it unique among live statements, matching the original psqlodbc's
+     * "SQL_CUR%p" scheme; the ODBC spec only requires the "SQL_CUR" prefix. */
+    if (statement->cursor_name[0] == '\0') {
+        snprintf(statement->cursor_name, sizeof(statement->cursor_name),
+                 "SQL_CUR%p", (void *)statement);
+    }
+
+    SQLSMALLINT full_length = copy_string_to_output(statement->cursor_name,
+                                                    cursor_name,
+                                                    buffer_length,
+                                                    name_length_ptr);
+
+    /* Truncation occurs when the buffer cannot hold the name plus its NUL. */
+    if (cursor_name && buffer_length > 0 && full_length >= buffer_length) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "01004",  /* String data, right truncated */
+                               0,
+                               "Cursor name was truncated to fit the buffer.");
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    return SQL_SUCCESS;
+}
+
+/**
+ * SQLCloseCursor — Close the cursor open on a statement and discard its result set.
+ *
+ * Equivalent to SQLFreeStmt(SQL_CLOSE) but reports SQLSTATE 24000 when no
+ * cursor is open, per the ODBC 3.x spec.
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - The cursor was closed.
+ *   SQL_ERROR          - No cursor was open (SQLSTATE 24000).
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlclosecursor-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLCloseCursor(SQLHSTMT statement_handle)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    /* Unlike SQLFreeStmt(SQL_CLOSE), SQLCloseCursor is an error when there is
+     * no open cursor to close. */
+    if (statement->state != STATEMENT_STATE_HAS_CURSOR) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "24000",  /* Invalid cursor state */
+                               0,
+                               "No cursor is open on this statement.");
+        return SQL_ERROR;
+    }
+
+    return statement_close_cursor(statement);
 }
 
 /**
@@ -2255,31 +2518,68 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
 
     switch (attribute) {
     case SQL_ATTR_CURSOR_TYPE:
-        if (value_as_ulen == SQL_CURSOR_FORWARD_ONLY) {
-            statement->cursor_type = SQL_CURSOR_FORWARD_ONLY;
+        /* FORWARD_ONLY and STATIC are both fully supported: the driver buffers
+         * the entire result set client-side, so a STATIC (scrollable, snapshot)
+         * cursor is served directly from that buffer. */
+        if (value_as_ulen == SQL_CURSOR_FORWARD_ONLY ||
+            value_as_ulen == SQL_CURSOR_STATIC) {
+            statement->cursor_type = value_as_ulen;
             return SQL_SUCCESS;
         }
-        /* All other cursor types (STATIC, KEYSET_DRIVEN, DYNAMIC) are not
-         * supported — downgrade to FORWARD_ONLY per ODBC convention. */
-        statement->cursor_type = SQL_CURSOR_FORWARD_ONLY;
+        /* KEYSET_DRIVEN and DYNAMIC require server-side keyset tracking we do
+         * not implement — map them to STATIC (also scrollable) and warn. */
+        statement->cursor_type = SQL_CURSOR_STATIC;
         diagnostics_add_record(&statement->diagnostics,
                                "01S02",  /* Option value changed */
                                0,
-                               "Cursor type changed to forward-only.");
+                               "Cursor type changed to static.");
         return SQL_SUCCESS_WITH_INFO;
 
     case SQL_ATTR_CONCURRENCY:
-        if (value_as_ulen == SQL_CONCUR_READ_ONLY) {
-            statement->concurrency = SQL_CONCUR_READ_ONLY;
+        /* READ_ONLY is the natural fit for the client-side snapshot this driver
+         * serves. ROWVER (optimistic concurrency by row version) is accepted
+         * as-is because positioned updates re-check the row on the server, so
+         * the application's chosen mode is honored without a separate code path.
+         * Other modes (LOCK, VALUES) are not supported and downgrade to
+         * READ_ONLY with a warning. */
+        if (value_as_ulen == SQL_CONCUR_READ_ONLY ||
+            value_as_ulen == SQL_CONCUR_ROWVER) {
+            statement->concurrency = value_as_ulen;
             return SQL_SUCCESS;
         }
-        /* Optimistic/pessimistic concurrency not supported — downgrade. */
         statement->concurrency = SQL_CONCUR_READ_ONLY;
         diagnostics_add_record(&statement->diagnostics,
                                "01S02",  /* Option value changed */
                                0,
                                "Concurrency changed to read-only.");
         return SQL_SUCCESS_WITH_INFO;
+
+    case SQL_ATTR_ROW_ARRAY_SIZE:
+    case SQL_ROWSET_SIZE:
+        /* Block (row-array) cursor size: how many rows a single fetch delivers
+         * into the application's bound column arrays. SQL_ROWSET_SIZE is the
+         * ODBC 2.x spelling used with SQLExtendedFetch; both map here. A size of
+         * 0 is invalid. */
+        if (value_as_ulen == 0) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY092",  /* Invalid attribute/option identifier */
+                                   0,
+                                   "SQL_ATTR_ROW_ARRAY_SIZE must be at least 1.");
+            return SQL_ERROR;
+        }
+        statement->row_array_size = value_as_ulen;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ROWS_FETCHED_PTR:
+        /* Application buffer that each fetch fills with the number of rows it
+         * actually returned into the bound arrays. */
+        statement->rows_fetched_ptr = (SQLULEN *)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ROW_STATUS_PTR:
+        /* Application array that each fetch fills with per-row status codes. */
+        statement->row_status_ptr = (SQLUSMALLINT *)value_ptr;
+        return SQL_SUCCESS;
 
     case SQL_ATTR_QUERY_TIMEOUT:
         statement->query_timeout_seconds = value_as_ulen;
@@ -2298,15 +2598,22 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
         return SQL_SUCCESS;
 
     case SQL_ATTR_CURSOR_SCROLLABLE:
-        if (value_as_ulen == SQL_NONSCROLLABLE) {
+        /* SQL_ATTR_CURSOR_SCROLLABLE is a higher-level shorthand for the cursor
+         * type: SCROLLABLE implies a STATIC cursor, NONSCROLLABLE a forward-only
+         * one. Keep the two attributes consistent by setting cursor_type here. */
+        if (value_as_ulen == SQL_SCROLLABLE) {
+            statement->cursor_type = SQL_CURSOR_STATIC;
             return SQL_SUCCESS;
         }
-        /* Scrollable cursors not supported — report downgrade. */
+        if (value_as_ulen == SQL_NONSCROLLABLE) {
+            statement->cursor_type = SQL_CURSOR_FORWARD_ONLY;
+            return SQL_SUCCESS;
+        }
         diagnostics_add_record(&statement->diagnostics,
-                               "01S02",  /* Option value changed */
+                               "HY092",  /* Invalid attribute/option identifier */
                                0,
-                               "Scrollable cursors are not supported; using non-scrollable.");
-        return SQL_SUCCESS_WITH_INFO;
+                               "Invalid value for SQL_ATTR_CURSOR_SCROLLABLE.");
+        return SQL_ERROR;
 
     case SQL_ATTR_CURSOR_SENSITIVITY:
         if (value_as_ulen == SQL_UNSPECIFIED) {
@@ -2368,11 +2675,15 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
 
     switch (attribute) {
     case SQL_ATTR_CURSOR_TYPE:
+        /* The cursor-family attributes are 32-bit (SQLUINTEGER) values.
+         * Applications (and the reference driver) size their buffers as
+         * SQLUINTEGER and pass SQL_IS_UINTEGER, so writing a 64-bit SQLULEN here
+         * would overrun a 4-byte caller buffer and smash the stack. */
         if (value_ptr) {
-            *(SQLULEN *)value_ptr = statement->cursor_type;
+            *(SQLUINTEGER *)value_ptr = (SQLUINTEGER)statement->cursor_type;
         }
         if (string_length_ptr) {
-            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLUINTEGER);
         }
         return SQL_SUCCESS;
 
@@ -2422,12 +2733,17 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         return SQL_SUCCESS;
 
     case SQL_ATTR_CURSOR_SCROLLABLE:
-        /* Only forward-only cursors are supported */
+        /* Derived from the cursor type so both attributes stay consistent:
+         * any non-forward-only cursor (i.e. STATIC) is scrollable. Written as a
+         * 32-bit SQLUINTEGER — see the note on SQL_ATTR_CURSOR_TYPE above. */
         if (value_ptr) {
-            *(SQLULEN *)value_ptr = SQL_NONSCROLLABLE;
+            *(SQLUINTEGER *)value_ptr =
+                (statement->cursor_type == SQL_CURSOR_FORWARD_ONLY)
+                    ? (SQLUINTEGER)SQL_NONSCROLLABLE
+                    : (SQLUINTEGER)SQL_SCROLLABLE;
         }
         if (string_length_ptr) {
-            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLUINTEGER);
         }
         return SQL_SUCCESS;
 
@@ -2437,6 +2753,34 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ROW_ARRAY_SIZE:
+    case SQL_ROWSET_SIZE:
+        if (value_ptr) {
+            *(SQLULEN *)value_ptr = statement->row_array_size;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ROWS_FETCHED_PTR:
+        if (value_ptr) {
+            *(SQLULEN **)value_ptr = statement->rows_fetched_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN *);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ROW_STATUS_PTR:
+        if (value_ptr) {
+            *(SQLUSMALLINT **)value_ptr = statement->row_status_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLUSMALLINT *);
         }
         return SQL_SUCCESS;
 
@@ -3256,7 +3600,9 @@ SQLGetInfo(SQLHDBC      connection_handle,
         GETINFO_RETURN_USHORT(63);
 
     case SQL_MAX_CURSOR_NAME_LEN:
-        GETINFO_RETURN_USHORT(63);
+        /* Must match the limit enforced by SQLSetCursorName and the storage on
+         * the statement handle. The original psqlodbc reports 32. */
+        GETINFO_RETURN_USHORT(MAX_CURSOR_NAME_LENGTH);
 
     case SQL_MAX_PROCEDURE_NAME_LEN:
         GETINFO_RETURN_USHORT(63);
@@ -3274,11 +3620,16 @@ SQLGetInfo(SQLHDBC      connection_handle,
     case SQL_CONCAT_NULL_BEHAVIOR:
         GETINFO_RETURN_USHORT(SQL_CB_NULL);
 
+    /* The driver buffers each result set in full on the client side (via
+     * PQexec, tracked by current_row_position on the statement). Because the
+     * rows already live in the client-side PGresult, an open cursor genuinely
+     * survives a COMMIT or ROLLBACK — the fetch buffer is not tied to the
+     * server-side transaction. Report SQL_CB_PRESERVE to reflect that. */
     case SQL_CURSOR_COMMIT_BEHAVIOR:
-        GETINFO_RETURN_USHORT(SQL_CB_CLOSE);
+        GETINFO_RETURN_USHORT(SQL_CB_PRESERVE);
 
     case SQL_CURSOR_ROLLBACK_BEHAVIOR:
-        GETINFO_RETURN_USHORT(SQL_CB_CLOSE);
+        GETINFO_RETURN_USHORT(SQL_CB_PRESERVE);
 
     case SQL_DEFAULT_TXN_ISOLATION:
         GETINFO_RETURN_UINT(SQL_TXN_READ_COMMITTED);

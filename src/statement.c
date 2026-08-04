@@ -422,6 +422,11 @@ SQLRETURN statement_allocate(OdbcConnection *connection, SQLHANDLE *output_handl
     statement->noscan = SQL_NOSCAN_OFF;
     statement->metadata_id = false;
 
+    /* Block-cursor defaults: single-row fetch, no out-pointers registered. */
+    statement->row_array_size = 1;
+    statement->rows_fetched_ptr = NULL;
+    statement->row_status_ptr = NULL;
+
     if (!connection_add_statement(connection, statement)) {
         /* Connection's statement array is full */
         free(statement);
@@ -966,6 +971,13 @@ static SQLRETURN execute_procedure_call(OdbcStatement *statement)
 
     SQLRETURN execution_result = handle_execution_result(statement, result);
 
+    /* A failed procedure call inside an explicit transaction aborts it; recover
+     * per the configured error-rollback mode (see statement_execute). This is
+     * the "{ call ... }" escape path the error-rollback test exercises. */
+    if (execution_result == SQL_ERROR) {
+        connection_handle_statement_error(statement->parent_connection);
+    }
+
     /* If any OUT/INOUT value did not fit its bound buffer, the ODBC spec
      * requires reporting SQLSTATE 01004 (string data, right-truncated) and
      * SQL_SUCCESS_WITH_INFO. The indicator already carries the untruncated
@@ -1034,6 +1046,11 @@ SQLRETURN statement_execute(OdbcStatement *statement)
                                    "Failed to begin implicit transaction.");
             return SQL_ERROR;
         }
+
+        /* Mark a per-statement SAVEPOINT so that, under statement-level error
+         * rollback (Protocol=7.4-2), a failure of this statement can be undone
+         * without discarding the whole transaction's earlier work. */
+        connection_begin_statement_savepoint(statement->parent_connection);
     }
 
     /* Close any previous result from a prior execution */
@@ -1110,6 +1127,14 @@ SQLRETURN statement_execute(OdbcStatement *statement)
     }
 
     SQLRETURN execution_result = handle_execution_result(statement, result);
+
+    /* On error inside an explicit transaction, apply the configured recovery
+     * (statement-level savepoint rewind, whole-transaction rollback, or leave
+     * it to the application). This keeps a single failed statement from
+     * poisoning the rest of an otherwise-good transaction. */
+    if (execution_result == SQL_ERROR) {
+        connection_handle_statement_error(statement->parent_connection);
+    }
 
     /* A plain SQL "CALL proc(...)" returns its INOUT/OUT values as a result
      * row; copy them back and, when enabled, fetch any refcursor OUT values. */
@@ -1607,6 +1632,8 @@ static SQLRETURN execute_multi_statement(OdbcStatement *statement)
             PQclear(results[index]);
         }
         free(results);
+        /* Recover per the configured error-rollback mode (see statement_execute). */
+        connection_handle_statement_error(statement->parent_connection);
         return SQL_ERROR;
     }
 
@@ -1774,6 +1801,10 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
                                    "Failed to begin implicit transaction.");
             return SQL_ERROR;
         }
+
+        /* Establish the per-statement SAVEPOINT for statement-level error
+         * rollback (see connection_begin_statement_savepoint). */
+        connection_begin_statement_savepoint(statement->parent_connection);
     }
 
     /* Direct execution does not create a server-side prepared statement */
@@ -1847,6 +1878,11 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
     }
 
     SQLRETURN execution_result = handle_execution_result(statement, result);
+
+    /* Recover per the configured error-rollback mode (see statement_execute). */
+    if (execution_result == SQL_ERROR) {
+        connection_handle_statement_error(statement->parent_connection);
+    }
 
     /* A plain SQL "CALL proc(...)" returns its INOUT/OUT values as a result
      * row; copy them back and, when enabled, fetch any refcursor OUT values. */

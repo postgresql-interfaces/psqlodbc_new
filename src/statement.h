@@ -76,6 +76,16 @@ typedef struct OdbcDescriptor {
  * Names are auto-generated as "_psqlodbc2_stmt_<counter>". */
 #define MAX_PREPARED_NAME_LENGTH 64
 
+/* Maximum length of an application-supplied cursor name, matching the value
+ * reported by SQLGetInfo(SQL_MAX_CURSOR_NAME_LEN). The original psqlodbc caps
+ * cursor names at 32 characters; we match it for drop-in compatibility. */
+#define MAX_CURSOR_NAME_LENGTH 32
+
+/* Storage size for a cursor name: the maximum name length plus room for the
+ * terminating NUL. Auto-generated fallback names ("SQL_CUR<hex-pointer>") also
+ * fit comfortably within this bound. */
+#define CURSOR_NAME_BUFFER_SIZE (MAX_CURSOR_NAME_LENGTH + 1)
+
 typedef struct OdbcStatement {
     unsigned int magic_number;         /* Must equal STATEMENT_MAGIC_NUMBER when valid */
     StatementState state;
@@ -154,12 +164,37 @@ typedef struct OdbcStatement {
 
     /* Statement attributes (set via SQLSetStmtAttr).
      * These persist across SQL_CLOSE but are reset when the handle is freed. */
-    SQLULEN cursor_type;               /* SQL_CURSOR_FORWARD_ONLY (only supported type) */
+    SQLULEN cursor_type;               /* SQL_CURSOR_FORWARD_ONLY or SQL_CURSOR_STATIC.
+                                        * STATIC cursors are scrollable, served from the
+                                        * fully-buffered client-side result set. */
     SQLULEN concurrency;               /* SQL_CONCUR_READ_ONLY (only supported type) */
     SQLULEN query_timeout_seconds;     /* 0 = no timeout */
     SQLULEN max_rows;                  /* 0 = no limit */
     SQLULEN noscan;                    /* SQL_NOSCAN_OFF (default) or SQL_NOSCAN_ON */
     bool metadata_id;                  /* Whether identifiers are treated as case-insensitive */
+
+    /* Application-supplied cursor name (via SQLSetCursorName). Empty string
+     * means "not set" — in that case SQLGetCursorName auto-generates a unique
+     * "SQL_CUR<...>" name and stores it here so repeated calls stay stable. */
+    char cursor_name[CURSOR_NAME_BUFFER_SIZE];
+
+    /* ---- Block (row-array) cursor attributes ---- */
+
+    /* Number of rows the application wants fetched into its bound arrays per
+     * SQLFetch/SQLFetchScroll call (SQL_ATTR_ROW_ARRAY_SIZE). 1 = single-row
+     * fetch (the default). When > 1 each bound column buffer is treated as an
+     * array of that many elements, filled with consecutive rows of the rowset. */
+    SQLULEN row_array_size;
+
+    /* Application buffer that receives the number of rows actually placed into
+     * the bound arrays by the most recent fetch (SQL_ATTR_ROWS_FETCHED_PTR).
+     * NULL when the application has not requested the count. */
+    SQLULEN *rows_fetched_ptr;
+
+    /* Application array (row_array_size elements) that receives the per-row
+     * status (SQL_ROW_SUCCESS / SQL_ROW_NOROW / ...) after each fetch
+     * (SQL_ATTR_ROW_STATUS_PTR). NULL when not requested. */
+    SQLUSMALLINT *row_status_ptr;
 } OdbcStatement;
 
 /* ---- Public Interface ---- */

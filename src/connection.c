@@ -350,6 +350,10 @@ void connection_info_clear(ConnectionInfo *info)
     /* Size-reporting defaults match the original psqlodbc driver. */
     info->unknown_sizes = UNKNOWN_SIZES_MAX;
     info->max_varchar_size = DEFAULT_MAX_VARCHAR_SIZE;
+
+    /* No explicit error-rollback mode until the connection string sets one via
+     * "Protocol=7.4-N"; the driver then falls back to its server-based default. */
+    info->rollback_on_error = ROLLBACK_ON_ERROR_UNSPECIFIED;
 }
 
 bool connection_add_statement(OdbcConnection *connection,
@@ -433,6 +437,8 @@ SQLRETURN connection_begin_transaction(OdbcConnection *connection)
 
     PQclear(result);
     connection->transaction_state = TRANSACTION_STATE_ACTIVE;
+    /* A fresh transaction has no per-statement savepoint yet. */
+    connection->statement_savepoint_active = false;
     return SQL_SUCCESS;
 }
 
@@ -471,11 +477,13 @@ SQLRETURN connection_commit(OdbcConnection *connection)
         }
         /* Even if COMMIT fails, the transaction is over from PG's perspective */
         connection->transaction_state = TRANSACTION_STATE_IDLE;
+        connection->statement_savepoint_active = false;
         return SQL_ERROR;
     }
 
     PQclear(result);
     connection->transaction_state = TRANSACTION_STATE_IDLE;
+    connection->statement_savepoint_active = false;
     return SQL_SUCCESS;
 }
 
@@ -514,11 +522,13 @@ SQLRETURN connection_rollback(OdbcConnection *connection)
         }
         /* Rollback failure still resets transaction state — PG aborts the txn */
         connection->transaction_state = TRANSACTION_STATE_IDLE;
+        connection->statement_savepoint_active = false;
         return SQL_ERROR;
     }
 
     PQclear(result);
     connection->transaction_state = TRANSACTION_STATE_IDLE;
+    connection->statement_savepoint_active = false;
     return SQL_SUCCESS;
 }
 
@@ -542,4 +552,118 @@ SQLRETURN connection_ensure_transaction(OdbcConnection *connection)
     }
 
     return connection_begin_transaction(connection);
+}
+
+int connection_effective_rollback_on_error(const OdbcConnection *connection)
+{
+    if (!connection) {
+        return ROLLBACK_ON_ERROR_STATEMENT;
+    }
+
+    /* An explicit "Protocol=7.4-N" wins. */
+    if (connection->info.rollback_on_error != ROLLBACK_ON_ERROR_UNSPECIFIED) {
+        return connection->info.rollback_on_error;
+    }
+
+    /* Default: statement-level rollback. Every server this driver targets
+     * supports SAVEPOINT (PostgreSQL 8.0+), so we always default to the
+     * finest-grained recovery, matching the original driver's behavior on
+     * modern servers. */
+    return ROLLBACK_ON_ERROR_STATEMENT;
+}
+
+void connection_begin_statement_savepoint(OdbcConnection *connection)
+{
+    if (!connection || !connection->libpq_connection) {
+        return;
+    }
+
+    /* Savepoints only make sense inside an active (non-failed) transaction and
+     * only when statement-level rollback was requested. */
+    if (connection->transaction_state != TRANSACTION_STATE_ACTIVE) {
+        return;
+    }
+    if (connection_effective_rollback_on_error(connection) != ROLLBACK_ON_ERROR_STATEMENT) {
+        return;
+    }
+
+    /* Re-issuing "SAVEPOINT <name>" without releasing the prior one would leak:
+     * PostgreSQL does NOT overwrite a same-named savepoint — it shadows the old
+     * one and keeps it on the subtransaction stack, so a long transaction that
+     * runs many statements would accumulate one dead subtransaction per
+     * statement. So when a savepoint from the previous statement is still
+     * standing, RELEASE it first (which also destroys any shadowed ones),
+     * then create a fresh one marking the point just before this statement.
+     * Sent as a single combined command to avoid an extra round-trip. */
+    const char *savepoint_command;
+    if (connection->statement_savepoint_active) {
+        savepoint_command =
+            "RELEASE SAVEPOINT " PER_STATEMENT_SAVEPOINT_NAME ";"
+            "SAVEPOINT " PER_STATEMENT_SAVEPOINT_NAME;
+    } else {
+        savepoint_command = "SAVEPOINT " PER_STATEMENT_SAVEPOINT_NAME;
+    }
+
+    PGresult *result = PQexec(connection->libpq_connection, savepoint_command);
+    if (result && PQresultStatus(result) == PGRES_COMMAND_OK) {
+        connection->statement_savepoint_active = true;
+    } else {
+        /* If the combined RELEASE+SAVEPOINT failed (e.g. the previous savepoint
+         * was already gone), the standing savepoint can no longer be relied on.
+         * Fall back to a plain SAVEPOINT so this statement still gets savepoint
+         * protection where possible. */
+        if (result) {
+            PQclear(result);
+        }
+        result = PQexec(connection->libpq_connection,
+                        "SAVEPOINT " PER_STATEMENT_SAVEPOINT_NAME);
+        connection->statement_savepoint_active =
+            (result && PQresultStatus(result) == PGRES_COMMAND_OK);
+    }
+    /* On outright failure we simply proceed without a savepoint — the statement
+     * still runs; worst case an error falls back to whole-transaction failure. */
+    if (result) {
+        PQclear(result);
+    }
+}
+
+void connection_handle_statement_error(OdbcConnection *connection)
+{
+    if (!connection || !connection->libpq_connection) {
+        return;
+    }
+
+    /* Only relevant inside an explicit transaction that a statement just
+     * aborted. In autocommit-ON mode PostgreSQL already rolled the implicit
+     * transaction back for us. */
+    if (connection->transaction_state != TRANSACTION_STATE_FAILED) {
+        return;
+    }
+
+    int mode = connection_effective_rollback_on_error(connection);
+
+    if (mode == ROLLBACK_ON_ERROR_STATEMENT && connection->statement_savepoint_active) {
+        /* Undo just the failed statement by rewinding to the savepoint taken
+         * before it. This clears the aborted state so the transaction — and
+         * its earlier successful statements — can continue. */
+        PGresult *result = PQexec(connection->libpq_connection,
+                                  "ROLLBACK TO " PER_STATEMENT_SAVEPOINT_NAME);
+        if (result && PQresultStatus(result) == PGRES_COMMAND_OK) {
+            connection->transaction_state = TRANSACTION_STATE_ACTIVE;
+        }
+        if (result) {
+            PQclear(result);
+        }
+        return;
+    }
+
+    if (mode == ROLLBACK_ON_ERROR_TRANSACTION) {
+        /* Discard the whole transaction automatically. */
+        connection_rollback(connection);
+        return;
+    }
+
+    /* ROLLBACK_ON_ERROR_NOTHING (or STATEMENT without an active savepoint):
+     * leave the transaction FAILED for the application to resolve with its own
+     * SQLEndTran(ROLLBACK). */
 }
