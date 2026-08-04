@@ -69,12 +69,12 @@ jobs:
       run: meson compile -C builddir
 
     - name: Test (unit tests)
-      run: meson test -C builddir
+      run: meson test -C builddir --print-errorlogs
       env:
         PSQLODBC2_TEST_CONNSTR: ""
 
     - name: Test (with PostgreSQL)
-      run: meson test -C builddir
+      run: meson test -C builddir --print-errorlogs
       env:
         PSQLODBC2_TEST_CONNSTR: ${{ matrix.os == 'ubuntu-latest' && 'Server=localhost;Port=5432;Database=contrib_regression;UID=postgres;PWD=postgres' || 'Server=localhost;Port=5432;Database=contrib_regression' }}
 
@@ -147,11 +147,11 @@ jobs:
       run: meson compile -C builddir
 
     - name: Test (unit tests)
-      run: meson test -C builddir
+      run: meson test -C builddir --print-errorlogs
       env:
         PSQLODBC2_TEST_CONNSTR: ""
 
     - name: Test (with PostgreSQL)
-      run: meson test -C builddir
+      run: meson test -C builddir --print-errorlogs
       env:
         PSQLODBC2_TEST_CONNSTR: "Server=localhost;Port=5432;Database=postgres;UID=postgres;PWD=postgres"

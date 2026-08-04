@@ -201,7 +201,11 @@ static void test_columns_returns_metadata(void)
 
     result = fn_num_result_cols(statement, &column_count);
     assert(result == SQL_SUCCESS);
-    assert(column_count == 18);
+    /* 18 ODBC-standard SQLColumns columns plus 8 driver-specific trailing
+     * columns (DISPLAY_SIZE, FIELD_TYPE, AUTO_INCREMENT, PHYSICAL NUMBER,
+     * TABLE OID, BASE TYPEID, TYPMOD, TABLE INFO) that mirror the original
+     * psqlodbc's synthesized result set. See catalog_columns in catalog.c. */
+    assert(column_count == 26);
 
     /* Should have 2 columns: id and name */
     int row_count = 0;
