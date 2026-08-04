@@ -23,7 +23,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-ORIG_TEST_DIR="${HOME}/projects/psqlodbc/test"
+# Location of the upstream psqlodbc source tree. Its test/ subdirectory supplies
+# the regression test programs and expected outputs we run against our driver.
+# Override PSQLODBC_ORIG_DIR in CI (where the source lives elsewhere).
+ORIG_TEST_DIR="${PSQLODBC_ORIG_DIR:-${HOME}/projects/psqlodbc}/test"
 BUILD_DIR="${PROJECT_DIR}/builddir"
 
 # Configurable via environment
@@ -131,12 +134,34 @@ echo "Loading sample tables..."
 psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" 2>/dev/null || true
 psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q -f "$ORIG_TEST_DIR/sampletables.sql" 2>/dev/null
 
-# Determine which tests to run
+# Determine which tests to run.
+#
+# When no test names are given, run the FULL upstream regression suite so our
+# coverage matches psqlodbc exactly. This list is the canonical set of 60 tests
+# from upstream's test/tests manifest (the TESTBINS list), kept in the same
+# order. Five *-test.c sources in upstream (deprecated, describe, prepare-rows,
+# specialcolumns, timestamp) are intentionally excluded: they are not in the
+# upstream manifest either (orphaned helpers / missing expected output).
+#
+# Tests that don't yet build or pass against our driver surface as SKIP/FAIL
+# rather than being silently omitted -- that is what "same coverage" requires.
+# If upstream adds or removes a test, update this list to match.
 if [ $# -gt 0 ]; then
     TESTS="$@"
 else
-    # Start with a subset of tests most likely to work with our current feature set
-    TESTS="connect select stmthandles update commands getresult prepare params"
+    TESTS="connect stmthandles select update commands multistmt getresult \
+colattribute result-conversions prepare premature params \
+leading-literal-numparams param-conversions parse identity notice \
+arraybinding insertreturning dataatexecution boolsaschar cvtnulldate \
+alter async-enable quotes cursors cursor-movement cursor-scrollable \
+cursor-commit cursor-name cursor-block-delete bookmark ard-bookmark-oom \
+declare-fetch-commit declare-fetch-block positioned-update \
+bulkoperations catalogfunctions bindcol lfconversion cte errors \
+error-rollback diagnostic numeric large-object \
+large-object-data-at-exec odbc-escapes odbc-conformance wchar-char \
+params-batch-exec fetch-refcursors descrec descriptors-free \
+primarykeys-include interval-overflow conn-settings percent-decode \
+dbms-version surrogate-pair"
 fi
 
 echo ""

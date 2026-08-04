@@ -78,6 +78,30 @@ jobs:
       env:
         PSQLODBC2_TEST_CONNSTR: ${{ matrix.os == 'ubuntu-latest' && 'Server=localhost;Port=5432;Database=contrib_regression;UID=postgres;PWD=postgres' || 'Server=localhost;Port=5432;Database=contrib_regression' }}
 
+    # Upstream psqlodbc regression suite: compile the original test programs
+    # against our driver and diff against upstream's expected output. This is the
+    # coverage-parity signal. It is NON-BLOCKING for now (continue-on-error)
+    # because not all 60 tests pass yet; the step prints the pass/fail/skip
+    # summary so regressions are visible without failing the build.
+    - name: Checkout upstream psqlodbc (for regression tests)
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions/checkout@v4
+      with:
+        repository: postgresql-interfaces/psqlodbc
+        path: upstream-psqlodbc
+
+    - name: Regression suite (upstream parity, non-blocking)
+      if: matrix.os == 'ubuntu-latest'
+      continue-on-error: true
+      run: regress/run_regression.sh
+      env:
+        PSQLODBC_ORIG_DIR: ${{ github.workspace }}/upstream-psqlodbc
+        PG_HOST: localhost
+        PG_PORT: "5432"
+        PG_DATABASE: contrib_regression
+        PG_USER: postgres
+        PGPASSWORD: postgres
+
   windows:
     name: Windows
     runs-on: windows-latest

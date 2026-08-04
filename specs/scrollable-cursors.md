@@ -6,6 +6,8 @@ Implement scrollable cursor support: the `SQLFetchScroll`/`SQLExtendedFetch` eng
 ## Objective
 When complete, these regression tests pass: `cursors`, `cursor-movement`, `cursor-scrollable`, `cursor-commit`, `cursor-name`, `declare-fetch-commit`, `declare-fetch-block`. (Positioned update/delete and bookmarks are covered in the separate bulk-operations spec.)
 
+> Phase assignments below are grounded in observed failure evidence — see [`cursor-cluster-diagnosis.md`](cursor-cluster-diagnosis.md). Note in particular that `cursors` is a cheap client-side fix (GetInfo value + commit-survival), NOT a DECLARE/FETCH test.
+
 ## Problem Statement
 The driver currently only supports forward-only `SQLFetch`. It caches the entire PGresult client-side already (via PQexec), so scrollable navigation over that cache is achievable. Server-side DECLARE/FETCH mode (UseDeclareFetch) is needed for the declare-fetch tests and for large result chunking.
 
@@ -15,7 +17,7 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 3. **Cursor type attributes** — SQL_ATTR_CURSOR_TYPE (FORWARD_ONLY/STATIC), SQL_ATTR_CURSOR_SCROLLABLE (maps SCROLLABLE→STATIC, NONSCROLLABLE→FORWARD_ONLY). Already partially stubbed in statement attributes.
 4. **Cursor naming** — SQLSetCursorName/SQLGetCursorName with auto-generated "SQL_CUR..." names, length validation (SQLSTATE 34000).
 5. **Server-side DECLARE/FETCH** — when UseDeclareFetch=1, execute SELECT by issuing `DECLARE <name> [SCROLL] CURSOR [WITH HOLD] FOR <query>` inside a transaction, then `FETCH`/`MOVE` in chunks of the Fetch size. Cursor survival across COMMIT depends on WITH HOLD (Protocol=7.4-2).
-6. **Cursor GetInfo** — SQL_CURSOR_COMMIT_BEHAVIOR, SQL_CURSOR_ROLLBACK_BEHAVIOR, SQL_MAX_CURSOR_NAME_LEN.
+6. **Cursor GetInfo + commit survival** — SQL_CURSOR_COMMIT_BEHAVIOR and SQL_CURSOR_ROLLBACK_BEHAVIOR must report `SQL_CB_PRESERVE` (currently hardcoded to `SQL_CB_CLOSE` in odbc_api.c ~lines 3277–3281), and the client-side result buffer must survive `SQLEndTran` so a post-commit `SQLFetch` does not fail with HY010. Also SQL_MAX_CURSOR_NAME_LEN. This is what the `cursors` test exercises — it uses a plain connection, NOT DECLARE/FETCH.
 
 ## Relevant Files
 
@@ -38,6 +40,12 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 
 ## Implementation Phases
 
+### Phase 0: Cursor GetInfo + commit survival (fixes cursors)
+- Change SQL_CURSOR_COMMIT_BEHAVIOR and SQL_CURSOR_ROLLBACK_BEHAVIOR in odbc_api.c (~lines 3277–3281) from SQL_CB_CLOSE to SQL_CB_PRESERVE
+- Ensure the client-side result buffer is NOT discarded at SQLEndTran, so a post-commit SQLFetch continues instead of returning HY010
+- Smallest, self-contained change; independent of the scroll engine and DECLARE/FETCH
+- Verify cursors passes
+
 ### Phase 1: Client-side scrollable fetch (fixes cursor-movement, cursor-scrollable)
 - Implement extended_fetch over the cached PGresult: NEXT/PRIOR/FIRST/LAST/ABSOLUTE/RELATIVE
 - Track cursor position; handle BOF/EOF (return SQL_NO_DATA)
@@ -51,12 +59,11 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 - Reject over-length names (SQLSTATE 34000)
 - SQL_MAX_CURSOR_NAME_LEN in SQLGetInfo
 
-### Phase 3: Server-side DECLARE/FETCH (fixes cursors, cursor-commit, declare-fetch-commit, declare-fetch-block)
-- Parse UseDeclareFetch and Fetch connection options
+### Phase 3: Server-side DECLARE/FETCH (fixes cursor-commit, declare-fetch-commit, declare-fetch-block)
+- Parse UseDeclareFetch and Fetch connection options (declare-fetch-commit connects with `UseDeclareFetch=1;Fetch=1;Protocol=7.4-2`)
 - When enabled, wrap SELECT in DECLARE CURSOR and fetch in chunks
 - Handle COMMIT behavior (WITH HOLD when Protocol=7.4-2)
 - Block cursors: SQL_ATTR_ROW_ARRAY_SIZE, SQL_ATTR_ROWS_FETCHED_PTR
-- Cursor commit/rollback behavior GetInfo
 
 ## Team Orchestration
 - Builder implements → Reviewer checks quality → Validator verifies correctness.
@@ -80,7 +87,16 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 
 ## Step by Step Tasks
 
-### 1. Client-side Scrollable Fetch
+### 1. Cursor GetInfo + Commit Survival
+- **Task ID**: implement-cursor-getinfo
+- **Depends On**: none
+- **Assigned To**: builder-cursors
+- **Agent Type**: builder
+- **Parallel**: false
+- SQL_CURSOR_COMMIT_BEHAVIOR / SQL_CURSOR_ROLLBACK_BEHAVIOR → SQL_CB_PRESERVE; keep result buffer alive across SQLEndTran
+- Verify cursors passes
+
+### 2. Client-side Scrollable Fetch
 - **Task ID**: implement-scroll-engine
 - **Depends On**: none
 - **Assigned To**: builder-cursors
@@ -89,7 +105,7 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 - extended_fetch with all orientations; SQLFetchScroll/SQLExtendedFetch exports
 - Verify cursor-movement, cursor-scrollable pass
 
-### 2. Cursor Naming
+### 3. Cursor Naming
 - **Task ID**: implement-cursor-name
 - **Depends On**: implement-scroll-engine
 - **Assigned To**: builder-cursors
@@ -98,18 +114,18 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 - SQLSetCursorName/SQLGetCursorName, length validation
 - Verify cursor-name passes
 
-### 3. Server-side DECLARE/FETCH
+### 4. Server-side DECLARE/FETCH
 - **Task ID**: implement-declare-fetch
 - **Depends On**: implement-scroll-engine
 - **Assigned To**: builder-cursors
 - **Agent Type**: builder
 - **Parallel**: false
 - UseDeclareFetch/Fetch options, DECLARE CURSOR wrapping, chunked FETCH
-- Verify cursors, cursor-commit, declare-fetch-commit, declare-fetch-block pass
+- Verify cursor-commit, declare-fetch-commit, declare-fetch-block pass
 
-### 4. Validate
+### 5. Validate
 - **Task ID**: validate-all
-- **Depends On**: implement-cursor-name, implement-declare-fetch
+- **Depends On**: implement-cursor-getinfo, implement-cursor-name, implement-declare-fetch
 - **Assigned To**: validator-cursors
 - **Agent Type**: validator
 - **Parallel**: false
@@ -127,6 +143,6 @@ The driver currently only supports forward-only `SQLFetch`. It caches the entire
 - `export PATH="/usr/local/pgsql/18/bin:$PATH" && ./regress/run_regression.sh cursors cursor-movement cursor-scrollable cursor-commit cursor-name declare-fetch-commit declare-fetch-block`
 
 ## Notes
-- The client-side engine is simpler and unlocks the most tests — do it first.
+- The GetInfo + commit-survival fix (Phase 0) is the smallest change and fixes `cursors` on its own — do it first. The client-side scroll engine (Phase 1) is next: still no server protocol work, and it unlocks the most tests.
 - For DECLARE/FETCH, cursors require an open transaction; when autocommit is on, the driver opens an implicit transaction for the cursor and closes it appropriately.
 - Positioned updates (SQLSetPos UPDATE/DELETE) and keyset-driven cursors are OUT OF SCOPE here — see the bulk-operations spec.
