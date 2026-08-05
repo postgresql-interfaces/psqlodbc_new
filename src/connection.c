@@ -92,6 +92,7 @@ SQLRETURN connection_allocate(OdbcEnvironment *environment, SQLHANDLE *output_ha
     connection->login_timeout = 0;
     connection->connection_timeout = 0;
     connection->access_mode = SQL_MODE_READ_WRITE;
+    connection->batch_size = DEFAULT_BATCH_SIZE;
 
     if (!environment_add_connection(environment, connection)) {
         /* Environment's connection array is full */
@@ -143,7 +144,11 @@ SQLRETURN connection_free(SQLHANDLE handle)
         environment_remove_connection(connection->parent_environment, connection);
     }
 
-    /* Clean up all resources */
+    /* Clean up all resources.
+     * LIMITATION: explicit descriptors (SQLAllocHandle(SQL_HANDLE_DESC)) that the
+     * application never freed with SQLFreeHandle are leaked here — the connection
+     * does not track them in a list. Not exercised by Phase 1 tests; revisit when
+     * explicit-descriptor lifetime management is fully implemented. */
     diagnostics_clear(&connection->diagnostics);
     connection_clear_notices(connection);
     connection_info_clear(&connection->info);

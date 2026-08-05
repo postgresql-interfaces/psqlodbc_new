@@ -186,10 +186,15 @@ SQLAllocHandle(SQLSMALLINT handle_type,
         return statement_allocate(connection, output_handle);
     }
 
-    case SQL_HANDLE_DESC:
-        /* Descriptor handles will be implemented in a future module */
-        *output_handle = SQL_NULL_HANDLE;
-        return SQL_ERROR;
+    case SQL_HANDLE_DESC: {
+        /* An explicit descriptor is allocated on (and owned by) a connection. */
+        OdbcConnection *connection = (OdbcConnection *)input_handle;
+        if (!connection || connection->magic_number != CONNECTION_MAGIC_NUMBER) {
+            *output_handle = SQL_NULL_HANDLE;
+            return SQL_INVALID_HANDLE;
+        }
+        return descriptor_allocate_explicit(connection, output_handle);
+    }
 
     default:
         *output_handle = SQL_NULL_HANDLE;
@@ -233,8 +238,9 @@ SQLFreeHandle(SQLSMALLINT handle_type,
         return statement_free(handle);
 
     case SQL_HANDLE_DESC:
-        /* Descriptor handles will be implemented in a future module */
-        return SQL_ERROR;
+        /* Freeing an explicit descriptor reverts any statement still using it as
+         * its active ARD/APD back to that statement's implicit descriptor. */
+        return descriptor_free_explicit((OdbcDescriptor *)handle);
 
     default:
         return SQL_INVALID_HANDLE;
@@ -457,6 +463,9 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         SQL_API_SQLCLOSECURSOR,
         SQL_API_SQLSETPOS,
         SQL_API_SQLBULKOPERATIONS,
+        SQL_API_SQLGETDESCREC,
+        SQL_API_SQLSETDESCREC,
+        SQL_API_SQLCOPYDESC,
     };
     int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
 
@@ -2369,6 +2378,16 @@ SQLSetConnectAttr(SQLHDBC     connection_handle,
          * erroring out (the positioned-update test sets it before a large fetch). */
         return SQL_SUCCESS;
 
+    case SQL_ATTR_PGOPT_BATCHSIZE:
+        /* Array-execution batch size: how many bound parameter sets are grouped
+         * per server round-trip during an array (SQL_ATTR_PARAMSET_SIZE > 1)
+         * execution. A non-positive value falls back to the default. */
+        connection->batch_size = (int)(SQLLEN)(intptr_t)value_ptr;
+        if (connection->batch_size <= 0) {
+            connection->batch_size = DEFAULT_BATCH_SIZE;
+        }
+        return SQL_SUCCESS;
+
     default:
         diagnostics_add_record(&connection->diagnostics,
                                "HY092",  /* Invalid attribute/option identifier */
@@ -2476,6 +2495,15 @@ SQLGetConnectAttr(SQLHDBC     connection_handle,
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLUINTEGER);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PGOPT_BATCHSIZE:
+        if (value_ptr) {
+            *(SQLINTEGER *)value_ptr = (SQLINTEGER)connection->batch_size;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLINTEGER);
         }
         return SQL_SUCCESS;
 
@@ -2766,6 +2794,82 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
                                "Cursor sensitivity changed to unspecified.");
         return SQL_SUCCESS_WITH_INFO;
 
+    case SQL_ATTR_APP_ROW_DESC:
+    case SQL_ATTR_APP_PARAM_DESC: {
+        /* Attach an explicit descriptor as this statement's active ARD/APD, or
+         * revert to the implicit one when the application passes SQL_NULL_HDESC.
+         * The IMP_ROW_DESC/IMP_PARAM_DESC descriptors are automatic and cannot be
+         * replaced, so they are not settable here. */
+        OdbcDescriptor **active_slot =
+            (attribute == SQL_ATTR_APP_ROW_DESC)
+                ? &statement->active_app_row_descriptor
+                : &statement->active_app_param_descriptor;
+        OdbcDescriptor *implicit =
+            (attribute == SQL_ATTR_APP_ROW_DESC)
+                ? &statement->implicit_app_row_descriptor
+                : &statement->implicit_app_param_descriptor;
+
+        if (value_ptr == SQL_NULL_HDESC) {
+            *active_slot = implicit;
+            return SQL_SUCCESS;
+        }
+
+        OdbcDescriptor *descriptor = (OdbcDescriptor *)value_ptr;
+        if (descriptor->magic_number != DESCRIPTOR_MAGIC_NUMBER ||
+            !descriptor->is_explicit) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY024",  /* Invalid attribute value */
+                                   0,
+                                   "Value is not a valid explicit descriptor handle.");
+            return SQL_ERROR;
+        }
+        /* The descriptor now serves this statement in the requested role, routing
+         * its field access to the statement's backing store. */
+        descriptor->role = (attribute == SQL_ATTR_APP_ROW_DESC)
+                               ? DESCRIPTOR_ROLE_APP_ROW
+                               : DESCRIPTOR_ROLE_APP_PARAM;
+        descriptor->owning_statement = statement;
+        *active_slot = descriptor;
+        return SQL_SUCCESS;
+    }
+
+    case SQL_ATTR_PARAMSET_SIZE:
+        /* Number of parameter sets (rows) to execute. When > 1 with bound
+         * parameters, the statement runs once per set (array execution). A size
+         * of 0 is invalid. */
+        if (value_as_ulen == 0) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY092",  /* Invalid attribute/option identifier */
+                                   0,
+                                   "SQL_ATTR_PARAMSET_SIZE must be at least 1.");
+            return SQL_ERROR;
+        }
+        statement->paramset_size = value_as_ulen;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_STATUS_PTR:
+        /* Application array that array execution fills with per-row status. */
+        statement->param_status_ptr = (SQLUSMALLINT *)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAMS_PROCESSED_PTR:
+        /* Application buffer that receives the number of parameter sets
+         * processed by an array execution. */
+        statement->params_processed_ptr = (SQLULEN *)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_OPERATION_PTR:
+        /* Application array marking which parameter sets to ignore. Accepted and
+         * stored; not exercised deeply by the tests. */
+        statement->param_operation_ptr = (SQLUSMALLINT *)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_BIND_TYPE:
+        /* SQL_PARAM_BIND_BY_COLUMN (column-wise arrays) or a row-wise structure
+         * size. Column-wise is what the array-execution path implements. */
+        statement->param_bind_type = value_as_ulen;
+        return SQL_SUCCESS;
+
     default:
         diagnostics_add_record(&statement->diagnostics,
                                "HY092",  /* Invalid attribute/option identifier */
@@ -2958,8 +3062,9 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         return SQL_SUCCESS;
 
     case SQL_ATTR_IMP_PARAM_DESC:
-        /* Return the statement's embedded implicit parameter descriptor so the
-         * application can name parameters via SQLSetDescField. */
+        /* The implicit parameter descriptor (IPD) is automatic and never
+         * replaceable; return it so the application can name parameters via
+         * SQLSetDescField. */
         if (value_ptr) {
             *(SQLHANDLE *)value_ptr = (SQLHANDLE)&statement->implicit_param_descriptor;
         }
@@ -2968,26 +3073,81 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         }
         return SQL_SUCCESS;
 
-    case SQL_ATTR_APP_ROW_DESC:
-        /* Return the statement's embedded application row descriptor so the
-         * application can set per-column formatting via SQLSetDescField
-         * (notably SQL_DESC_PRECISION for interval fractional seconds). */
+    case SQL_ATTR_IMP_ROW_DESC:
+        /* The implementation row descriptor (IRD) is automatic and read-only;
+         * it exposes the executed result's column metadata. */
         if (value_ptr) {
-            *(SQLHANDLE *)value_ptr = (SQLHANDLE)&statement->app_row_descriptor;
+            *(SQLHANDLE *)value_ptr = (SQLHANDLE)&statement->implicit_row_descriptor;
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLHANDLE);
         }
         return SQL_SUCCESS;
 
-    case SQL_ATTR_IMP_ROW_DESC:
-    case SQL_ATTR_APP_PARAM_DESC:
-        /* Other descriptor handles are not implemented */
+    case SQL_ATTR_APP_ROW_DESC:
+        /* Return whichever descriptor is currently active as the ARD — the
+         * statement's implicit one by default, or an explicit descriptor the
+         * application attached via SQLSetStmtAttr. */
         if (value_ptr) {
-            *(SQLHANDLE *)value_ptr = SQL_NULL_HANDLE;
+            *(SQLHANDLE *)value_ptr = (SQLHANDLE)statement->active_app_row_descriptor;
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLHANDLE);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_APP_PARAM_DESC:
+        /* Return whichever descriptor is currently active as the APD. */
+        if (value_ptr) {
+            *(SQLHANDLE *)value_ptr = (SQLHANDLE)statement->active_app_param_descriptor;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLHANDLE);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAMSET_SIZE:
+        if (value_ptr) {
+            *(SQLULEN *)value_ptr = statement->paramset_size;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_STATUS_PTR:
+        if (value_ptr) {
+            *(SQLUSMALLINT **)value_ptr = statement->param_status_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLUSMALLINT *);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAMS_PROCESSED_PTR:
+        if (value_ptr) {
+            *(SQLULEN **)value_ptr = statement->params_processed_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN *);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_OPERATION_PTR:
+        if (value_ptr) {
+            *(SQLUSMALLINT **)value_ptr = statement->param_operation_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLUSMALLINT *);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PARAM_BIND_TYPE:
+        if (value_ptr) {
+            *(SQLULEN *)value_ptr = statement->param_bind_type;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
         }
         return SQL_SUCCESS;
 
@@ -4158,24 +4318,25 @@ SQLNativeSql(SQLHDBC     connection_handle,
 /**
  * SQLSetDescField — Set a single field of a descriptor record.
  *
- * The driver exposes only the implicit parameter descriptor (IPD). The one
- * field it honors is SQL_DESC_NAME, which names a parameter marker so that
- * procedure calls can bind arguments by name and map named OUT parameters back
- * from the result set. Other fields are accepted and ignored so that callers
- * are not forced to special-case this driver.
+ * Delegates to the descriptor module, which routes the write to the correct
+ * backing store for the descriptor's role: the ARD updates column_bindings (and
+ * SQL_DESC_PRECISION overrides interval fractional-second formatting), the APD
+ * updates parameter_bindings, the IPD's SQL_DESC_NAME names a parameter marker,
+ * and the read-only IRD rejects writes.
  *
  * Parameters:
- *   descriptor_handle - An IPD handle obtained from
- *                       SQLGetStmtAttr(SQL_ATTR_IMP_PARAM_DESC).
- *   record_number     - The 1-based parameter position to describe.
- *   field_identifier  - The descriptor field to set (SQL_DESC_NAME honored).
- *   value             - The field value (a string for SQL_DESC_NAME).
+ *   descriptor_handle - A descriptor handle (implicit via SQLGetStmtAttr, or an
+ *                       explicit handle from SQLAllocHandle(SQL_HANDLE_DESC)).
+ *   record_number     - The 1-based column/parameter position to describe.
+ *   field_identifier  - The descriptor field to set.
+ *   value             - The field value (a string for SQL_DESC_NAME, otherwise
+ *                       an integer smuggled through the pointer parameter).
  *   buffer_length     - Length of value in bytes, or SQL_NTS.
  *
  * Returns:
  *   SQL_SUCCESS        - Field set (or accepted and ignored).
- *   SQL_ERROR          - Invalid record number.
- *   SQL_INVALID_HANDLE - descriptor_handle is not a valid IPD handle.
+ *   SQL_ERROR          - Invalid record number or read-only descriptor.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid descriptor handle.
  *
  * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetdescfield-function
  */
@@ -4186,80 +4347,23 @@ SQLSetDescField(SQLHDESC    descriptor_handle,
                 SQLPOINTER  value,
                 SQLINTEGER  buffer_length)
 {
-    OdbcDescriptor *descriptor = (OdbcDescriptor *)descriptor_handle;
-
-    if (!descriptor || descriptor->magic_number != DESCRIPTOR_MAGIC_NUMBER ||
-        !descriptor->owner) {
-        return SQL_INVALID_HANDLE;
-    }
-
-    OdbcStatement *statement = descriptor->owner;
-
-    /* On the application row descriptor (ARD), the only field we honor is
-     * SQL_DESC_PRECISION, which overrides the fractional-second precision used
-     * when formatting an interval result column. record_number is the 1-based
-     * column position. The stored value is later clamped to <= 9 at use, so an
-     * arbitrarily large precision here cannot overrun any buffer. */
-    if (descriptor->role == DESCRIPTOR_ROLE_APP_ROW) {
-        if (field_identifier != SQL_DESC_PRECISION) {
-            return SQL_SUCCESS;  /* Other ARD fields accepted and ignored. */
-        }
-        if (record_number < 1 || record_number > MAX_BOUND_COLUMNS) {
-            diagnostics_add_record(&statement->diagnostics,
-                                   "07009",  /* Invalid descriptor index */
-                                   0,
-                                   "Column number is out of range in SQLSetDescField.");
-            return SQL_ERROR;
-        }
-        /* SQL_DESC_PRECISION is passed as an integer smuggled through the
-         * pointer parameter (SQLSetDescField's value is SQLPOINTER). */
-        statement->column_precision_override[record_number - 1] =
-            (int)(intptr_t)value;
-        return SQL_SUCCESS;
-    }
-
-    /* Implicit parameter descriptor (IPD): we only act on SQL_DESC_NAME; other
-     * fields are accepted silently. */
-    if (field_identifier != SQL_DESC_NAME) {
-        return SQL_SUCCESS;
-    }
-
-    if (record_number < 1 || record_number > MAX_PARAMETERS) {
-        diagnostics_add_record(&statement->diagnostics,
-                               "07009",  /* Invalid descriptor index */
-                               0,
-                               "Parameter number is out of range in SQLSetDescField.");
-        return SQL_ERROR;
-    }
-
-    ParameterBinding *binding = &statement->parameter_bindings[record_number - 1];
-
-    if (!value) {
-        binding->name[0] = '\0';
-        return SQL_SUCCESS;
-    }
-
-    size_t name_length = (buffer_length == SQL_NTS)
-        ? strlen((const char *)value)
-        : (size_t)buffer_length;
-    if (name_length >= sizeof(binding->name)) {
-        name_length = sizeof(binding->name) - 1;
-    }
-    memcpy(binding->name, value, name_length);
-    binding->name[name_length] = '\0';
-    return SQL_SUCCESS;
+    return descriptor_set_field((OdbcDescriptor *)descriptor_handle,
+                                record_number, field_identifier, value,
+                                buffer_length);
 }
 
 /**
  * SQLGetDescField — Retrieve a single field of a descriptor record.
  *
- * Complements SQLSetDescField for the implicit parameter descriptor. Only
- * SQL_DESC_NAME is meaningfully supported; other fields report empty/zero.
+ * Delegates to the descriptor module. For the IRD it reports the executed
+ * result's column metadata (type, octet length, precision, scale, nullability,
+ * name); for the ARD/APD it reports the current binding; for the IPD it reports
+ * the parameter name.
  *
  * Parameters:
- *   descriptor_handle - An IPD handle from SQLGetStmtAttr(SQL_ATTR_IMP_PARAM_DESC).
- *   record_number     - The 1-based parameter position.
- *   field_identifier  - The descriptor field to read (SQL_DESC_NAME supported).
+ *   descriptor_handle - A descriptor handle.
+ *   record_number     - The 1-based column/parameter position.
+ *   field_identifier  - The descriptor field to read.
  *   value             - Output buffer for the field value.
  *   buffer_length     - Size of value in bytes.
  *   string_length     - Output: actual length of a string field.
@@ -4267,7 +4371,7 @@ SQLSetDescField(SQLHDESC    descriptor_handle,
  * Returns:
  *   SQL_SUCCESS        - Field retrieved.
  *   SQL_ERROR          - Invalid record number.
- *   SQL_INVALID_HANDLE - descriptor_handle is not a valid IPD handle.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid descriptor handle.
  *
  * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetdescfield-function
  */
@@ -4279,38 +4383,124 @@ SQLGetDescField(SQLHDESC    descriptor_handle,
                 SQLINTEGER  buffer_length,
                 SQLINTEGER *string_length)
 {
-    OdbcDescriptor *descriptor = (OdbcDescriptor *)descriptor_handle;
+    return descriptor_get_field((OdbcDescriptor *)descriptor_handle,
+                                record_number, field_identifier, value,
+                                buffer_length, string_length);
+}
 
-    if (!descriptor || descriptor->magic_number != DESCRIPTOR_MAGIC_NUMBER ||
-        !descriptor->owner) {
-        return SQL_INVALID_HANDLE;
-    }
+/**
+ * SQLGetDescRec — Retrieve multiple common fields of a descriptor record at once.
+ *
+ * Convenience wrapper that fetches the name, type, sub-type, length, precision,
+ * scale, and nullability of one descriptor record. Name and nullability are only
+ * meaningful for the implementation descriptors (IRD/IPD). Delegates to the
+ * descriptor module.
+ *
+ * Parameters:
+ *   descriptor_handle  - A descriptor handle.
+ *   record_number      - The 1-based column/parameter position.
+ *   name               - Output buffer for SQL_DESC_NAME (implementation descs).
+ *   name_buffer_length - Size of name in bytes.
+ *   name_length        - Output: actual length of the name.
+ *   type               - Output: SQL_DESC_TYPE.
+ *   sub_type           - Output: SQL_DESC_DATETIME_INTERVAL_CODE (unused here).
+ *   length             - Output: SQL_DESC_OCTET_LENGTH.
+ *   precision          - Output: SQL_DESC_PRECISION.
+ *   scale              - Output: SQL_DESC_SCALE.
+ *   nullable           - Output: SQL_DESC_NULLABLE (implementation descriptors).
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Record retrieved.
+ *   SQL_NO_DATA        - record_number is past the last defined record.
+ *   SQL_ERROR          - Invalid record number.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid descriptor handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetdescrec-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLGetDescRec(SQLHDESC     descriptor_handle,
+              SQLSMALLINT  record_number,
+              SQLCHAR     *name,
+              SQLSMALLINT  name_buffer_length,
+              SQLSMALLINT *name_length,
+              SQLSMALLINT *type,
+              SQLSMALLINT *sub_type,
+              SQLLEN      *length,
+              SQLSMALLINT *precision,
+              SQLSMALLINT *scale,
+              SQLSMALLINT *nullable)
+{
+    return descriptor_get_rec((OdbcDescriptor *)descriptor_handle, record_number,
+                              name, name_buffer_length, name_length, type,
+                              sub_type, length, precision, scale, nullable);
+}
 
-    OdbcStatement *statement = descriptor->owner;
+/**
+ * SQLSetDescRec — Set the common fields of a descriptor record in one call.
+ *
+ * Convenience wrapper for binding a record. On an ARD it binds a result column
+ * (write-through to column_bindings) so a later SQLFetch fills the buffer; on an
+ * APD it binds a parameter; on the read-only IRD it fails. Delegates to the
+ * descriptor module.
+ *
+ * Parameters:
+ *   descriptor_handle - A descriptor handle.
+ *   record_number     - The 1-based column/parameter position.
+ *   type              - SQL_DESC_TYPE (the C type on an application descriptor).
+ *   sub_type          - SQL_DESC_DATETIME_INTERVAL_CODE (unused here).
+ *   length            - SQL_DESC_OCTET_LENGTH (buffer size in bytes).
+ *   precision         - SQL_DESC_PRECISION.
+ *   scale             - SQL_DESC_SCALE.
+ *   data_ptr          - SQL_DESC_DATA_PTR (application buffer).
+ *   string_length_ptr - SQL_DESC_OCTET_LENGTH_PTR.
+ *   indicator_ptr     - SQL_DESC_INDICATOR_PTR.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Record set.
+ *   SQL_ERROR          - Invalid record number or read-only descriptor.
+ *   SQL_INVALID_HANDLE - descriptor_handle is not a valid descriptor handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetdescrec-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSetDescRec(SQLHDESC    descriptor_handle,
+              SQLSMALLINT record_number,
+              SQLSMALLINT type,
+              SQLSMALLINT sub_type,
+              SQLLEN      length,
+              SQLSMALLINT precision,
+              SQLSMALLINT scale,
+              SQLPOINTER  data_ptr,
+              SQLLEN     *string_length_ptr,
+              SQLLEN     *indicator_ptr)
+{
+    return descriptor_set_rec((OdbcDescriptor *)descriptor_handle, record_number,
+                              type, sub_type, length, precision, scale, data_ptr,
+                              string_length_ptr, indicator_ptr);
+}
 
-    if (field_identifier != SQL_DESC_NAME) {
-        if (string_length) {
-            *string_length = 0;
-        }
-        return SQL_SUCCESS;
-    }
-
-    if (record_number < 1 || record_number > MAX_PARAMETERS) {
-        return SQL_ERROR;
-    }
-
-    const char *name = statement->parameter_bindings[record_number - 1].name;
-    SQLINTEGER name_length = (SQLINTEGER)strlen(name);
-    if (string_length) {
-        *string_length = name_length;
-    }
-    if (value && buffer_length > 0) {
-        SQLINTEGER copy_length = name_length;
-        if (copy_length >= buffer_length) {
-            copy_length = buffer_length - 1;
-        }
-        memcpy(value, name, (size_t)copy_length);
-        ((char *)value)[copy_length] = '\0';
-    }
-    return SQL_SUCCESS;
+/**
+ * SQLCopyDesc — Copy all descriptor fields from a source to a target descriptor.
+ *
+ * Copies every defined record from source to target. The IRD is a valid source
+ * but never a valid target (it is read-only). Delegates to the descriptor
+ * module.
+ *
+ * Parameters:
+ *   source_descriptor_handle - The descriptor to copy from.
+ *   target_descriptor_handle - The descriptor to copy into.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Copy completed.
+ *   SQL_ERROR          - Target is read-only or copy not permitted.
+ *   SQL_INVALID_HANDLE - Either handle is not a valid descriptor handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlcopydesc-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLCopyDesc(SQLHDESC source_descriptor_handle,
+            SQLHDESC target_descriptor_handle)
+{
+    return descriptor_copy((OdbcDescriptor *)source_descriptor_handle,
+                           (OdbcDescriptor *)target_descriptor_handle);
 }

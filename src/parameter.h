@@ -107,6 +107,31 @@ SQLRETURN parameter_build_libpq_arrays(const ParameterBinding *bindings,
                                        int *out_count);
 
 /*
+ * Build the parallel libpq arrays for ONE parameter set (row) of an array-bound
+ * (SQL_ATTR_PARAMSET_SIZE > 1) execution.
+ *
+ * For column-wise binding (SQL_PARAM_BIND_BY_COLUMN, the only mode the tests
+ * use) each bound parameter's value_buffer and indicator_or_length are treated
+ * as arrays. Element row_index of parameter p lives at:
+ *     value:     (char *)binding->value_buffer + row_index * element_stride
+ *     indicator: binding->indicator_or_length
+ *                    ? &binding->indicator_or_length[row_index] : NULL
+ * where element_stride is binding->buffer_length when the application supplied a
+ * nonzero buffer length, otherwise the byte size of the bound C type (fixed C
+ * types such as SQL_C_LONG are bound with buffer_length 0).
+ *
+ * Semantics of the output arrays are identical to parameter_build_libpq_arrays;
+ * free them with parameter_free_libpq_arrays. Returns SQL_SUCCESS or SQL_ERROR
+ * on allocation failure.
+ */
+SQLRETURN parameter_build_libpq_arrays_for_row(const ParameterBinding *bindings,
+                                               SQLULEN row_index,
+                                               const char ***out_values,
+                                               int **out_lengths,
+                                               int **out_formats,
+                                               int *out_count);
+
+/*
  * Free the arrays allocated by parameter_build_libpq_arrays.
  * Safe to call with NULL pointers (no-op in that case).
  */

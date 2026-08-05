@@ -19,6 +19,7 @@
 #include "parameter.h"
 #include "column_binding.h"
 #include "query_parser.h"
+#include "descriptor.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -46,32 +47,10 @@ typedef enum {
  * "STM2" in ASCII = 0x53544D32 */
 #define STATEMENT_MAGIC_NUMBER 0x53544D32
 
-/* Magic number for descriptor handles. "DSC2" in ASCII = 0x44534332.
- * The driver exposes only the implicit parameter descriptor (IPD), embedded in
- * each statement, so applications can set parameter names via SQLSetDescField. */
-#define DESCRIPTOR_MAGIC_NUMBER 0x44534332
-
-/* Distinguishes which embedded descriptor an OdbcDescriptor handle refers to,
- * so SQLSetDescField can route a field to the right target (parameter names for
- * the IPD, per-column precision for the ARD). */
-typedef enum DescriptorRole {
-    DESCRIPTOR_ROLE_IMPLICIT_PARAM,   /* IPD: names parameter markers */
-    DESCRIPTOR_ROLE_APP_ROW           /* ARD: per-column result formatting (precision) */
-} DescriptorRole;
-
-/* ---- Embedded Descriptor (IPD / ARD) ----
- *
- * A minimal descriptor. As the IPD it lets an application name parameter markers
- * via SQLSetDescField(hIpd, N, SQL_DESC_NAME, ...); as the ARD it carries the
- * per-column SQL_DESC_PRECISION override used when formatting result values
- * (e.g. interval fractional-second precision). Both are embedded in the owning
- * statement (never allocated separately); owner points back so descriptor calls
- * can update the statement's bindings/overrides. */
-typedef struct OdbcDescriptor {
-    unsigned int magic_number;      /* DESCRIPTOR_MAGIC_NUMBER when valid */
-    DescriptorRole role;            /* Which descriptor this handle represents */
-    struct OdbcStatement *owner;    /* Statement this descriptor belongs to */
-} OdbcDescriptor;
+/* The descriptor handle type (OdbcDescriptor), its DESCRIPTOR_MAGIC_NUMBER, and
+ * the DescriptorRole enum now live in descriptor.h, included above, so the four
+ * implicit descriptors below and the explicit-descriptor entry points can share
+ * one definition. */
 
 /* Maximum length for server-side prepared statement names.
  * Names are auto-generated as "_psqlodbc2_stmt_<counter>". */
@@ -206,8 +185,25 @@ typedef struct OdbcStatement {
     int current_row_position;          /* Cursor: -1 = before first row; 0..N-1 = row index */
     ParameterBinding parameter_bindings[MAX_PARAMETERS]; /* Bound parameter descriptors */
     int bound_parameter_count;         /* Number of currently bound parameters */
-    OdbcDescriptor implicit_param_descriptor; /* IPD handle returned by SQLGetStmtAttr */
-    OdbcDescriptor app_row_descriptor;        /* ARD handle returned by SQLGetStmtAttr */
+
+    /* The four automatically-allocated (implicit) ODBC descriptors, embedded in
+     * the statement. They are thin views over the statement's backing stores:
+     * the ARD/APD read and write column_bindings/parameter_bindings, the IRD
+     * reports the executed result's column metadata (read-only), and the IPD
+     * names parameter markers. See descriptor.h for the role semantics. */
+    OdbcDescriptor implicit_app_row_descriptor;    /* ARD */
+    OdbcDescriptor implicit_app_param_descriptor;  /* APD */
+    OdbcDescriptor implicit_row_descriptor;        /* IRD (read-only) */
+    OdbcDescriptor implicit_param_descriptor;      /* IPD */
+
+    /* The descriptors currently in effect for this statement. They default to
+     * the embedded implicit ARD/APD above but can be swapped for an explicitly
+     * allocated descriptor via SQLSetStmtAttr(SQL_ATTR_APP_ROW_DESC /
+     * APP_PARAM_DESC), and are reverted to the implicit ones when that explicit
+     * descriptor is freed or the application sets SQL_NULL_HDESC. */
+    OdbcDescriptor *active_app_row_descriptor;
+    OdbcDescriptor *active_app_param_descriptor;
+
     ColumnBinding column_bindings[MAX_BOUND_COLUMNS];  /* Bound column descriptors for SQLFetch */
     int bound_column_count;            /* Number of currently bound columns */
 
@@ -250,6 +246,35 @@ typedef struct OdbcStatement {
      * status (SQL_ROW_SUCCESS / SQL_ROW_NOROW / ...) after each fetch
      * (SQL_ATTR_ROW_STATUS_PTR). NULL when not requested. */
     SQLUSMALLINT *row_status_ptr;
+
+    /* Number of parameter-value sets (rows) the application supplies per
+     * execution (SQL_ATTR_PARAMSET_SIZE). Defaults to 1 (a single set). When
+     * greater than 1 with bound parameters, statement_execute /
+     * statement_exec_direct run the statement once per set (see the array-
+     * execution path), reading each bound parameter's value at the set's stride
+     * index. */
+    SQLULEN paramset_size;
+
+    /* SQL_ATTR_PARAM_STATUS_PTR: application array (paramset_size elements) that
+     * receives per-row status after an array execution (SQL_PARAM_SUCCESS /
+     * SQL_PARAM_SUCCESS_WITH_INFO / SQL_PARAM_ERROR / SQL_PARAM_UNUSED). NULL
+     * when the application did not request per-row status. */
+    SQLUSMALLINT *param_status_ptr;
+
+    /* SQL_ATTR_PARAMS_PROCESSED_PTR: application buffer that receives the number
+     * of parameter sets processed by an array execution. NULL when not
+     * requested. */
+    SQLULEN *params_processed_ptr;
+
+    /* SQL_ATTR_PARAM_OPERATION_PTR: application array that can mark individual
+     * parameter sets to be ignored (SQL_PARAM_IGNORE). Accepted and stored; the
+     * tests do not exercise it deeply. NULL when not set. */
+    SQLUSMALLINT *param_operation_ptr;
+
+    /* SQL_ATTR_PARAM_BIND_TYPE: SQL_PARAM_BIND_BY_COLUMN (0, column-wise arrays,
+     * the mode the tests use) or a nonzero row-wise structure size. Stored as
+     * given; column-wise is what the array-execution path implements. */
+    SQLULEN param_bind_type;
 
     /* ---- Bookmark support ---- */
 

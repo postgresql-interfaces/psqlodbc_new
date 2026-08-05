@@ -6,6 +6,7 @@ driver_sources = files(
     'connection_string.c',
     'dsn_config.c',
     'statement.c',
+    'descriptor.c',
     'parameter.c',
     'column_binding.c',
     'type_mapping.c',

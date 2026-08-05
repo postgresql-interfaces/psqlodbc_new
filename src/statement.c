@@ -60,6 +60,18 @@ static SQLRETURN execute_multi_statement(OdbcStatement *statement);
 static SQLRETURN handle_call_result(OdbcStatement *statement, SQLRETURN execution_result);
 static bool translated_sql_is_call(const OdbcStatement *statement);
 
+/* Adopt a PGresult as the current result set without freeing it (used for the
+ * result-set chain). Defined below statement_execute; forward-declared because
+ * the array-execution path above it chains RETURNING results. */
+static SQLRETURN apply_result_as_current(OdbcStatement *statement, PGresult *result);
+
+/* Execute a statement once per bound parameter set (SQL_ATTR_PARAMSET_SIZE > 1),
+ * filling the per-row status array and chaining any result sets. Defined below;
+ * forward-declared for statement_execute / statement_exec_direct. use_prepared
+ * selects PQexecPrepared (prepared statement) vs PQexecParams (direct SQL). */
+static SQLRETURN statement_execute_parameter_array(OdbcStatement *statement,
+                                                   bool use_prepared);
+
 /*
  * Populate a per-position cast-suffix array from the statement's parameter
  * bindings, for use by query_translate_markers.
@@ -466,16 +478,21 @@ SQLRETURN statement_allocate(OdbcConnection *connection, SQLHANDLE *output_handl
     statement->affected_row_count = -1;
     statement->current_row_position = -1;
 
-    /* The implicit parameter descriptor is embedded in the statement; it
-     * points back so SQLSetDescField can update this statement's bindings. */
-    statement->implicit_param_descriptor.magic_number = DESCRIPTOR_MAGIC_NUMBER;
-    statement->implicit_param_descriptor.role = DESCRIPTOR_ROLE_IMPLICIT_PARAM;
-    statement->implicit_param_descriptor.owner = statement;
-
-    /* The application row descriptor carries per-column precision overrides. */
-    statement->app_row_descriptor.magic_number = DESCRIPTOR_MAGIC_NUMBER;
-    statement->app_row_descriptor.role = DESCRIPTOR_ROLE_APP_ROW;
-    statement->app_row_descriptor.owner = statement;
+    /* Register the four implicit descriptors (ARD/APD/IRD/IPD) embedded in the
+     * statement. Each routes field access to this statement's backing stores
+     * (column_bindings / parameter_bindings / result metadata). The active
+     * ARD/APD start as the implicit ones; SQLSetStmtAttr can later swap in an
+     * explicitly allocated descriptor. */
+    descriptor_init_implicit(&statement->implicit_app_row_descriptor,
+                             DESCRIPTOR_ROLE_APP_ROW, statement);
+    descriptor_init_implicit(&statement->implicit_app_param_descriptor,
+                             DESCRIPTOR_ROLE_APP_PARAM, statement);
+    descriptor_init_implicit(&statement->implicit_row_descriptor,
+                             DESCRIPTOR_ROLE_IMPL_ROW, statement);
+    descriptor_init_implicit(&statement->implicit_param_descriptor,
+                             DESCRIPTOR_ROLE_IMPLICIT_PARAM, statement);
+    statement->active_app_row_descriptor = &statement->implicit_app_row_descriptor;
+    statement->active_app_param_descriptor = &statement->implicit_app_param_descriptor;
 
     /* No column precision overrides set initially (-1 = unset). */
     for (int column_index = 0; column_index < MAX_BOUND_COLUMNS; column_index++) {
@@ -494,6 +511,15 @@ SQLRETURN statement_allocate(OdbcConnection *connection, SQLHANDLE *output_handl
     statement->row_array_size = 1;
     statement->rows_fetched_ptr = NULL;
     statement->row_status_ptr = NULL;
+
+    /* A single parameter-value set until the application enables array binding.
+     * No status/processed/operation out-pointers and column-wise binding are the
+     * ODBC defaults. */
+    statement->paramset_size = 1;
+    statement->param_status_ptr = NULL;
+    statement->params_processed_ptr = NULL;
+    statement->param_operation_ptr = NULL;
+    statement->param_bind_type = SQL_PARAM_BIND_BY_COLUMN;
 
     /* Bookmarks are disabled by default (SQL_UB_OFF); the application opts in
      * via SQL_ATTR_USE_BOOKMARKS. No fetch-bookmark target and no column-0
@@ -1218,6 +1244,15 @@ SQLRETURN statement_execute(OdbcStatement *statement)
         return execute_multi_statement(statement);
     }
 
+    /* Array/batch parameter binding: when the application bound arrays of
+     * parameter values (SQL_ATTR_PARAMSET_SIZE > 1), execute once per set. The
+     * single-set path below is left exactly as it was for paramset_size <= 1. */
+    if (statement->paramset_size > 1 &&
+        statement->bound_parameter_count > 0 &&
+        statement->detected_param_count > 0) {
+        return statement_execute_parameter_array(statement, true /* use prepared */);
+    }
+
     PGconn *libpq_connection = statement->parent_connection->libpq_connection;
     PGresult *result = NULL;
 
@@ -1327,6 +1362,250 @@ static SQLRETURN apply_result_as_current(OdbcStatement *statement, PGresult *res
     statement->has_result_set = false;
     statement->affected_row_count = -1;
     return SQL_ERROR;
+}
+
+/*
+ * Execute a bound statement once for each parameter set when array/batch
+ * parameter binding is active (SQL_ATTR_PARAMSET_SIZE > 1). This implements the
+ * column-wise array-binding contract: parameter N's value for row R lives at
+ * element R of the array the application bound for parameter N, addressed by the
+ * per-element stride (buffer_length, or the fixed C-type width when the app bound
+ * a zero buffer_length).
+ *
+ * Batching and per-row status semantics (matching the original psqlodbc):
+ *   - The paramset_size rows are partitioned into consecutive batches of
+ *     connection->batch_size rows. batch_size is an application tuning knob
+ *     (SQL_ATTR_PGOPT_BATCHSIZE) that groups rows into a single logical unit.
+ *   - All rows in one batch share their per-row status: if any row in the batch
+ *     produced a server NOTICE, every row in that batch is reported
+ *     SQL_PARAM_SUCCESS_WITH_INFO; otherwise SQL_PARAM_SUCCESS.
+ *   - The first batch that fails aborts the whole execution: every row of the
+ *     failing batch is marked SQL_PARAM_ERROR and every row after it
+ *     SQL_PARAM_UNUSED. The single failing diagnostic is reported (server NOTICE
+ *     records are deliberately NOT promoted here, so the application sees only
+ *     the real error).
+ *
+ * Result-set handling:
+ *   - Rows that return tuples (e.g. DELETE ... RETURNING) have each per-row
+ *     result set chained onto pending_results so SQLMoreResults walks one result
+ *     set per parameter set. The first becomes the current result.
+ *   - Rows that return only a command tag (plain INSERT/UPDATE/DELETE) have their
+ *     results discarded; there is nothing to fetch.
+ *
+ * use_prepared selects PQexecPrepared (SQLExecute after SQLPrepare) versus
+ * PQexecParams (SQLExecDirect). Returns SQL_ERROR on the first failing batch,
+ * SQL_SUCCESS_WITH_INFO when any NOTICE was seen, otherwise SQL_SUCCESS.
+ */
+static SQLRETURN statement_execute_parameter_array(OdbcStatement *statement,
+                                                   bool use_prepared)
+{
+    OdbcConnection *connection = statement->parent_connection;
+    PGconn *libpq_connection = connection->libpq_connection;
+
+    SQLULEN row_count = statement->paramset_size;
+
+    /* batch_size is validated to be positive when set; guard defensively so a
+     * stray zero cannot produce a zero-length (infinite) batch loop. */
+    int batch_size = connection->batch_size;
+    if (batch_size <= 0) {
+        batch_size = DEFAULT_BATCH_SIZE;
+    }
+
+    /* Per-row result sets that carry tuples (RETURNING) are chained for
+     * SQLMoreResults. Allocated at full width up front; only tuple-bearing
+     * results are retained, so a plain INSERT array leaves this empty and it is
+     * freed below without ever being published. */
+    PGresult **chained_results = calloc((size_t)row_count, sizeof(PGresult *));
+    if (!chained_results) {
+        diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                               "Failed to allocate result chain for array execution.");
+        return SQL_ERROR;
+    }
+    int chained_count = 0;
+
+    /* Every row starts UNUSED; a row's status is set once its batch completes
+     * (or the batch fails). This gives the correct "rows after an error are
+     * UNUSED" result for free. */
+    if (statement->param_status_ptr) {
+        for (SQLULEN row = 0; row < row_count; row++) {
+            statement->param_status_ptr[row] = SQL_PARAM_UNUSED;
+        }
+    }
+
+    SQLULEN rows_processed = 0;
+    bool any_notice_overall = false;
+    bool execution_failed = false;
+
+    for (SQLULEN batch_start = 0; batch_start < row_count && !execution_failed;
+         batch_start += (SQLULEN)batch_size) {
+        SQLULEN batch_end = batch_start + (SQLULEN)batch_size;  /* exclusive */
+        if (batch_end > row_count) {
+            batch_end = row_count;
+        }
+
+        bool batch_had_notice = false;
+        bool batch_had_error = false;
+        PGresult *failing_result = NULL;
+
+        for (SQLULEN row = batch_start; row < batch_end; row++) {
+            /* SQL_PARAM_IGNORE lets the application exclude individual sets. Such
+             * a row is neither executed nor counted; its status stays UNUSED. */
+            if (statement->param_operation_ptr &&
+                statement->param_operation_ptr[row] == SQL_PARAM_IGNORE) {
+                continue;
+            }
+
+            /* Attribute NOTICEs to the row that produced them by clearing the
+             * connection's capture buffer immediately before each execution. */
+            connection_clear_notices(connection);
+
+            const char **param_values = NULL;
+            int *param_lengths = NULL;
+            int *param_formats = NULL;
+            int param_count = 0;
+
+            SQLRETURN build_result = parameter_build_libpq_arrays_for_row(
+                statement->parameter_bindings, row,
+                &param_values, &param_lengths, &param_formats, &param_count);
+            if (build_result != SQL_SUCCESS) {
+                diagnostics_clear(&statement->diagnostics);
+                diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                       "Failed to build parameter arrays for array execution.");
+                batch_had_error = true;
+                break;
+            }
+
+            /* Send only as many parameters as the SQL actually references (stale
+             * bindings from a prior, wider statement must not be forwarded). */
+            int effective_param_count = param_count;
+            if (effective_param_count > statement->detected_param_count) {
+                effective_param_count = statement->detected_param_count;
+            }
+
+            PGresult *result;
+            if (use_prepared) {
+                result = PQexecPrepared(libpq_connection,
+                                        statement->prepared_name,
+                                        effective_param_count,
+                                        param_values, param_lengths, param_formats,
+                                        0 /* text results */);
+            } else {
+                result = PQexecParams(libpq_connection,
+                                      statement->translated_sql,
+                                      effective_param_count,
+                                      NULL /* infer parameter types */,
+                                      param_values, param_lengths, param_formats,
+                                      0 /* text results */);
+            }
+
+            parameter_free_libpq_arrays(param_values, param_lengths, param_formats,
+                                        param_count);
+
+            rows_processed++;
+
+            ExecStatusType status = result ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+            if (status == PGRES_TUPLES_OK) {
+                if (connection->notice_count > 0) {
+                    batch_had_notice = true;
+                }
+                /* Retain tuple-bearing results for SQLMoreResults. */
+                chained_results[chained_count++] = result;
+            } else if (status == PGRES_COMMAND_OK) {
+                if (connection->notice_count > 0) {
+                    batch_had_notice = true;
+                }
+                PQclear(result);
+            } else {
+                /* First real failure in this batch: keep the result so its
+                 * diagnostic can be reported, and stop executing the batch. */
+                failing_result = result;
+                batch_had_error = true;
+                break;
+            }
+        }
+
+        if (batch_had_error) {
+            /* The whole batch is one logical unit: mark every row of it ERROR,
+             * regardless of which row actually failed. Rows after this batch stay
+             * UNUSED (they were never executed). */
+            if (statement->param_status_ptr) {
+                for (SQLULEN row = batch_start; row < batch_end; row++) {
+                    statement->param_status_ptr[row] = SQL_PARAM_ERROR;
+                }
+            }
+
+            /* Report exactly the failing statement's diagnostic. NOTICE records
+             * from earlier successful rows are intentionally not surfaced so the
+             * application sees only the error (matches the expected output). */
+            diagnostics_clear(&statement->diagnostics);
+            if (failing_result) {
+                error_add_diagnostic_from_result_ctx(&statement->diagnostics,
+                                                     failing_result, "HY000",
+                                                     "Error while executing the query");
+                PQclear(failing_result);
+            }
+
+            /* Poison an explicit transaction so the application must ROLLBACK,
+             * mirroring the single-set error path. */
+            if (connection->transaction_state == TRANSACTION_STATE_ACTIVE) {
+                connection->transaction_state = TRANSACTION_STATE_FAILED;
+            }
+
+            execution_failed = true;
+        } else {
+            SQLUSMALLINT batch_status =
+                batch_had_notice ? SQL_PARAM_SUCCESS_WITH_INFO : SQL_PARAM_SUCCESS;
+            if (batch_had_notice) {
+                any_notice_overall = true;
+            }
+            if (statement->param_status_ptr) {
+                for (SQLULEN row = batch_start; row < batch_end; row++) {
+                    /* Preserve UNUSED for SQL_PARAM_IGNORE'd rows. */
+                    if (statement->param_operation_ptr &&
+                        statement->param_operation_ptr[row] == SQL_PARAM_IGNORE) {
+                        continue;
+                    }
+                    statement->param_status_ptr[row] = batch_status;
+                }
+            }
+        }
+    }
+
+    if (statement->params_processed_ptr) {
+        *statement->params_processed_ptr = rows_processed;
+    }
+
+    /* Do not leak NOTICE captures forward to the next execution's status. */
+    connection_clear_notices(connection);
+
+    if (execution_failed) {
+        /* Discard any result sets collected before the failure. */
+        for (int index = 0; index < chained_count; index++) {
+            PQclear(chained_results[index]);
+        }
+        free(chained_results);
+        statement->has_result_set = false;
+        statement->affected_row_count = -1;
+        statement->state = STATEMENT_STATE_EXECUTED;
+        return SQL_ERROR;
+    }
+
+    if (chained_count > 0) {
+        /* Publish the result-set chain: chained_results[0] is current, the rest
+         * wait for SQLMoreResults (pending_result_index points one past current).*/
+        statement->pending_results = chained_results;
+        statement->pending_result_count = chained_count;
+        statement->pending_result_index = 1;
+        apply_result_as_current(statement, chained_results[0]);
+    } else {
+        /* No tuple-bearing rows (e.g. a plain INSERT array): nothing to fetch. */
+        free(chained_results);
+        statement->has_result_set = false;
+        statement->affected_row_count = (SQLLEN)rows_processed;
+        statement->state = STATEMENT_STATE_EXECUTED;
+    }
+
+    return any_notice_overall ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
 }
 
 /*
@@ -2473,6 +2752,15 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
             keyset_intercept_savepoint_command(statement, statement->sql_text);
         }
         return multi_result;
+    }
+
+    /* Array/batch parameter binding for direct execution: run once per bound
+     * parameter set (see statement_execute_parameter_array). The single-set path
+     * below is unchanged for paramset_size <= 1. */
+    if (statement->paramset_size > 1 &&
+        statement->detected_param_count > 0 &&
+        statement->bound_parameter_count > 0) {
+        return statement_execute_parameter_array(statement, false /* direct SQL */);
     }
 
     PGconn *libpq_connection = statement->parent_connection->libpq_connection;

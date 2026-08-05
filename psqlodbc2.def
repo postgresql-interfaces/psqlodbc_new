@@ -51,3 +51,6 @@ EXPORTS
     SQLCloseCursor      @49
     SQLSetPos           @50
     SQLBulkOperations   @51
+    SQLGetDescRec       @52
+    SQLSetDescRec       @53
+    SQLCopyDesc         @54

@@ -206,7 +206,20 @@ typedef struct OdbcConnection {
      * the driver-specific SQL_ATTR_PGOPT_MSJET (65549) attribute. Enables the
      * ("col" = 1) -> ("col"='1') boolean rewrite in the query parser. */
     bool ms_jet;
+
+    /* Array-execution batch size, set via SQLSetConnectAttr with the
+     * driver-specific SQL_ATTR_PGOPT_BATCHSIZE attribute. Controls how many
+     * parameter sets (rows) an array-bound execution groups per server
+     * round-trip: rows are partitioned into consecutive batches of this size,
+     * and a batch that errors marks all of its rows ERROR and stops (remaining
+     * rows UNUSED). Defaults to DEFAULT_BATCH_SIZE. A value <= 0 is treated as
+     * the default. */
+    int batch_size;
 } OdbcConnection;
+
+/* Default array-execution batch size when the application has not set
+ * SQL_ATTR_PGOPT_BATCHSIZE. Matches the original psqlodbc default. */
+#define DEFAULT_BATCH_SIZE 100
 
 /* Driver-specific connection attribute (from the original psqlodbc's
  * pgapifunc.h) that MS Access sets to request Jet-compatibility quirks. */
@@ -217,6 +230,11 @@ typedef struct OdbcConnection {
  * so the value has no effect, but the attribute must be accepted so applications
  * that tune fetch size don't fail. */
 #define SQL_ATTR_PGOPT_FETCH 65541
+
+/* Driver-specific attribute (psqlodbc pgapifunc.h) that sets the array-execution
+ * batch size — how many bound parameter sets are grouped per server round-trip
+ * (see OdbcConnection.batch_size). */
+#define SQL_ATTR_PGOPT_BATCHSIZE 65550
 
 /*
  * Clear all captured notices, freeing the heap-allocated message strings.

@@ -233,7 +233,10 @@ for test_name in $TESTS; do
     matched=""
     for candidate in "$expected_file" "$ORIG_TEST_DIR/expected/${test_name}"_*.out; do
         [ -f "$candidate" ] || continue
-        if diff -q "$candidate" "$result_file" >/dev/null 2>&1; then
+        # --strip-trailing-cr matches the original psqlodbc runsuite's diff
+        # invocation: some checked-in expected files carry stray CRLF line
+        # endings that are not significant to the test.
+        if diff -q --strip-trailing-cr "$candidate" "$result_file" >/dev/null 2>&1; then
             matched="$candidate"
             break
         fi

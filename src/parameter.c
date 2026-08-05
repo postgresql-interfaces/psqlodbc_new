@@ -519,7 +519,140 @@ char *convert_parameter_to_text(const ParameterBinding *binding, int *out_length
     return result;
 }
 
+/*
+ * Return the byte size of one element of the given ODBC C type.
+ *
+ * Array (paramset) binding needs this to compute the stride between consecutive
+ * parameter-set values when the application binds a fixed-width C type with a
+ * zero buffer_length (e.g. SQL_C_LONG / SQL_C_ULONG). For variable-length types
+ * (SQL_C_CHAR / SQL_C_BINARY / SQL_C_WCHAR) the application always supplies an
+ * explicit buffer_length, so those return 0 here and the caller falls back to
+ * the bound buffer_length. Returns 0 for any type without a natural fixed size.
+ */
+static size_t c_type_element_size(SQLSMALLINT c_type)
+{
+    switch (c_type) {
+    case SQL_C_SLONG:
+    case SQL_C_LONG:
+    case SQL_C_ULONG:
+        return sizeof(SQLINTEGER);
+    case SQL_C_SSHORT:
+    case SQL_C_SHORT:
+    case SQL_C_USHORT:
+        return sizeof(SQLSMALLINT);
+    case SQL_C_SBIGINT:
+    case SQL_C_UBIGINT:
+        return sizeof(SQLBIGINT);
+    case SQL_C_FLOAT:
+        return sizeof(SQLREAL);
+    case SQL_C_DOUBLE:
+        return sizeof(SQLDOUBLE);
+    case SQL_C_BIT:
+    case SQL_C_STINYINT:
+    case SQL_C_TINYINT:
+    case SQL_C_UTINYINT:
+        return sizeof(SQLCHAR);
+    case SQL_C_NUMERIC:
+        return sizeof(SQL_NUMERIC_STRUCT);
+    default:
+        /* Variable-length or unknown: caller uses the explicit buffer_length. */
+        return 0;
+    }
+}
+
+/*
+ * Byte stride between consecutive elements of a column-wise array-bound
+ * parameter. The application's explicit buffer_length takes precedence (that is
+ * how it lays out character/binary arrays); otherwise fall back to the natural
+ * size of the fixed-width C type.
+ */
+static size_t parameter_element_stride(const ParameterBinding *binding)
+{
+    if (binding->buffer_length > 0) {
+        return (size_t)binding->buffer_length;
+    }
+    return c_type_element_size(binding->c_type);
+}
+
 /* ---- Public Interface ---- */
+
+SQLRETURN parameter_build_libpq_arrays_for_row(const ParameterBinding *bindings,
+                                               SQLULEN row_index,
+                                               const char ***out_values,
+                                               int **out_lengths,
+                                               int **out_formats,
+                                               int *out_count)
+{
+    /* Find the highest bound parameter position, exactly like the single-set
+     * builder — unbound gaps below it are sent as SQL NULL. */
+    int highest_bound_position = 0;
+    for (int index = MAX_PARAMETERS - 1; index >= 0; index--) {
+        if (bindings[index].is_bound) {
+            highest_bound_position = index + 1;
+            break;
+        }
+    }
+
+    if (highest_bound_position == 0) {
+        *out_values = NULL;
+        *out_lengths = NULL;
+        *out_formats = NULL;
+        *out_count = 0;
+        return SQL_SUCCESS;
+    }
+
+    int parameter_count = highest_bound_position;
+
+    const char **values = calloc((size_t)parameter_count, sizeof(const char *));
+    int *lengths = calloc((size_t)parameter_count, sizeof(int));
+    int *formats = calloc((size_t)parameter_count, sizeof(int));
+
+    if (!values || !lengths || !formats) {
+        free(values);
+        free(lengths);
+        free(formats);
+        *out_values = NULL;
+        *out_lengths = NULL;
+        *out_formats = NULL;
+        *out_count = 0;
+        return SQL_ERROR;
+    }
+
+    for (int index = 0; index < parameter_count; index++) {
+        if (!bindings[index].is_bound) {
+            values[index] = NULL;
+            lengths[index] = 0;
+            formats[index] = 0;
+            continue;
+        }
+
+        /* Build a view of this parameter that points at element row_index of the
+         * bound arrays, then reuse the scalar text conversion. The original
+         * binding is not mutated (it is const); we copy it and offset the
+         * value/indicator pointers by the per-element stride. */
+        ParameterBinding row_view = bindings[index];
+        size_t stride = parameter_element_stride(&bindings[index]);
+        if (row_view.value_buffer && stride > 0) {
+            row_view.value_buffer =
+                (char *)bindings[index].value_buffer + (size_t)row_index * stride;
+        }
+        if (row_view.indicator_or_length) {
+            row_view.indicator_or_length =
+                &bindings[index].indicator_or_length[row_index];
+        }
+
+        int value_length = 0;
+        values[index] = convert_parameter_to_text(&row_view, &value_length);
+        lengths[index] = value_length;
+        formats[index] = 0;
+    }
+
+    *out_values = values;
+    *out_lengths = lengths;
+    *out_formats = formats;
+    *out_count = parameter_count;
+    return SQL_SUCCESS;
+}
 
 SQLRETURN parameter_bind(ParameterBinding *bindings,
                          int *bound_count,
