@@ -49,3 +49,5 @@ EXPORTS
     SQLSetCursorName    @47
     SQLGetCursorName    @48
     SQLCloseCursor      @49
+    SQLSetPos           @50
+    SQLBulkOperations   @51

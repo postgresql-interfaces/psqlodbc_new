@@ -455,6 +455,8 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         SQL_API_SQLSETCURSORNAME,
         SQL_API_SQLGETCURSORNAME,
         SQL_API_SQLCLOSECURSOR,
+        SQL_API_SQLSETPOS,
+        SQL_API_SQLBULKOPERATIONS,
     };
     int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
 
@@ -1347,6 +1349,88 @@ SQLCloseCursor(SQLHSTMT statement_handle)
 }
 
 /**
+ * SQLSetPos — Set the cursor position within a rowset and optionally perform a
+ * positioned UPDATE, DELETE, REFRESH, or ADD on the row(s) it identifies.
+ *
+ * Requires an updatable (keyset-driven) cursor — one where the application set
+ * SQL_ATTR_CURSOR_TYPE = SQL_CURSOR_KEYSET_DRIVEN or a writable
+ * SQL_ATTR_CONCURRENCY. The driver rewrites the cursor's SELECT to carry each
+ * row's hidden ctid, which SQLSetPos uses as the row key for positioned
+ * UPDATE/DELETE statements (see statement.c / results.c).
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle with an open updatable cursor.
+ *   row_number       - 1-based row within the current rowset; 0 targets every
+ *                      row in the rowset.
+ *   operation        - SQL_POSITION, SQL_REFRESH, SQL_UPDATE, SQL_DELETE, or
+ *                      SQL_ADD.
+ *   lock_type        - Row lock disposition (SQL_LOCK_NO_CHANGE, etc.). Accepted
+ *                      but not enforced, as PostgreSQL locking is transactional.
+ *
+ * Returns:
+ *   SQL_SUCCESS / SQL_SUCCESS_WITH_INFO - The operation completed.
+ *   SQL_ERROR          - No open cursor, non-updatable cursor, invalid row
+ *                        number, or the underlying statement failed.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlsetpos-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLSetPos(SQLHSTMT statement_handle, SQLSETPOSIROW row_number,
+          SQLUSMALLINT operation, SQLUSMALLINT lock_type)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return statement_set_pos(statement, row_number, operation, lock_type);
+}
+
+/**
+ * SQLBulkOperations — Perform a bulk INSERT, UPDATE, DELETE, or FETCH keyed by
+ * bookmarks against the current updatable cursor.
+ *
+ * Like SQLSetPos this requires an updatable (keyset-driven) cursor carrying a
+ * hidden ctid per row. The difference is how rows are identified: the
+ * bookmark-based operations target the row(s) whose bookmark(s) sit in the bound
+ * column-0 buffer (a single bookmark by default, or an array of
+ * SQL_ATTR_ROW_ARRAY_SIZE bookmarks for SQL_FETCH_BY_BOOKMARK). Each bookmark is
+ * a 4-byte Int4 = 1-based row index (see statement_resolve_int4_bookmark), which
+ * resolves to a buffered row and then to that row's ctid for the positioned
+ * statement.
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle with an open updatable cursor.
+ *   operation        - SQL_ADD, SQL_UPDATE_BY_BOOKMARK, SQL_DELETE_BY_BOOKMARK,
+ *                      or SQL_FETCH_BY_BOOKMARK.
+ *
+ * Returns:
+ *   SQL_SUCCESS / SQL_SUCCESS_WITH_INFO - The operation completed.
+ *   SQL_ERROR          - No open cursor, non-updatable cursor, an unresolvable
+ *                        bookmark, or the underlying statement failed.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlbulkoperations-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLBulkOperations(SQLHSTMT statement_handle, SQLSMALLINT operation)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return statement_bulk_operations(statement, (SQLUSMALLINT)operation);
+}
+
+/**
  * SQLGetData — Retrieve data for a single column in the current row.
  *
  * Returns the value of a specified column in the current row, converting it
@@ -2040,13 +2124,33 @@ SQLBindCol(SQLHSTMT     statement_handle,
 
     diagnostics_clear(&statement->diagnostics);
 
-    /* Column 0 is the bookmark column — not supported in this driver */
+    /* Column 0 is the bookmark column. Binding it registers a buffer that each
+     * fetch fills with the current row's bookmark; a NULL buffer unbinds it. */
     if (column_number == 0) {
-        diagnostics_add_record(&statement->diagnostics,
-                               "HYC00",  /* Optional feature not implemented */
-                               0,
-                               "Bookmark columns (column 0) are not supported.");
-        return SQL_ERROR;
+        /* Only the bookmark C types are valid for column 0. */
+        if (target_type != SQL_C_BOOKMARK && target_type != SQL_C_VARBOOKMARK) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HYC00",  /* Optional feature not implemented */
+                                   0,
+                                   "Column 0 can only be bound as a bookmark type.");
+            return SQL_ERROR;
+        }
+
+        if (!target_value) {
+            /* Unbind the bookmark column. */
+            statement->bookmark_bound = false;
+            statement->bookmark_target_type = 0;
+            statement->bookmark_buffer = NULL;
+            statement->bookmark_buffer_length = 0;
+            statement->bookmark_indicator = NULL;
+        } else {
+            statement->bookmark_bound = true;
+            statement->bookmark_target_type = target_type;
+            statement->bookmark_buffer = target_value;
+            statement->bookmark_buffer_length = buffer_length;
+            statement->bookmark_indicator = strlen_or_indicator;
+        }
+        return SQL_SUCCESS;
     }
 
     /* Validate column number upper bound */
@@ -2257,6 +2361,12 @@ SQLSetConnectAttr(SQLHDBC     connection_handle,
         /* MS Access sets this to request Jet-compatibility behavior; the only
          * effect we implement is the ("col" = 1) boolean rewrite in the parser. */
         connection->ms_jet = (value_as_uint != 0);
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_PGOPT_FETCH:
+        /* Declare/fetch batch size. We buffer results client-side, so this has
+         * no effect, but accept it so fetch-size tuning succeeds rather than
+         * erroring out (the positioned-update test sets it before a large fetch). */
         return SQL_SUCCESS;
 
     default:
@@ -2518,17 +2628,25 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
 
     switch (attribute) {
     case SQL_ATTR_CURSOR_TYPE:
-        /* FORWARD_ONLY and STATIC are both fully supported: the driver buffers
-         * the entire result set client-side, so a STATIC (scrollable, snapshot)
-         * cursor is served directly from that buffer. */
+        /* SQLGetStmtAttr reports the INTERNAL serving type (statement->cursor_type),
+         * which matches the reference driver: a keyset cursor is served from the
+         * same static client-side buffer and reports SQL_CURSOR_STATIC (which the
+         * positioned-update test accepts, since SQL_CURSOR_STATIC == 3). */
+
+        /* FORWARD_ONLY and STATIC are served directly from the buffered result. */
         if (value_as_ulen == SQL_CURSOR_FORWARD_ONLY ||
             value_as_ulen == SQL_CURSOR_STATIC) {
             statement->cursor_type = value_as_ulen;
             return SQL_SUCCESS;
         }
-        /* KEYSET_DRIVEN and DYNAMIC require server-side keyset tracking we do
-         * not implement — map them to STATIC (also scrollable) and warn. */
+        /* KEYSET_DRIVEN and DYNAMIC are served as a scrollable STATIC buffer,
+         * but a KEYSET_DRIVEN request also makes the cursor UPDATABLE: the
+         * SELECT is rewritten to capture each row's ctid so SQLSetPos can build
+         * positioned UPDATE/DELETE statements. */
         statement->cursor_type = SQL_CURSOR_STATIC;
+        if (value_as_ulen == SQL_CURSOR_KEYSET_DRIVEN) {
+            statement->is_updatable_cursor = true;
+        }
         diagnostics_add_record(&statement->diagnostics,
                                "01S02",  /* Option value changed */
                                0,
@@ -2536,14 +2654,14 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
         return SQL_SUCCESS_WITH_INFO;
 
     case SQL_ATTR_CONCURRENCY:
-        /* READ_ONLY is the natural fit for the client-side snapshot this driver
-         * serves. ROWVER (optimistic concurrency by row version) is accepted
-         * as-is because positioned updates re-check the row on the server, so
-         * the application's chosen mode is honored without a separate code path.
-         * Other modes (LOCK, VALUES) are not supported and downgrade to
-         * READ_ONLY with a warning. */
-        if (value_as_ulen == SQL_CONCUR_READ_ONLY ||
-            value_as_ulen == SQL_CONCUR_ROWVER) {
+        /* This driver serves every cursor from a client-side snapshot, so
+         * READ_ONLY is the only concurrency it truly implements; any other
+         * request is accepted but downgraded with 01S02. Updatability comes
+         * from SQL_ATTR_CURSOR_TYPE = SQL_CURSOR_KEYSET_DRIVEN, not from the
+         * concurrency mode — the upstream positioned-update / block-delete tests
+         * set both, and keying positioned operations on the cursor type keeps
+         * the concurrency contract (READ_ONLY round-trips) unchanged. */
+        if (value_as_ulen == SQL_CONCUR_READ_ONLY) {
             statement->concurrency = value_as_ulen;
             return SQL_SUCCESS;
         }
@@ -2579,6 +2697,28 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
     case SQL_ATTR_ROW_STATUS_PTR:
         /* Application array that each fetch fills with per-row status codes. */
         statement->row_status_ptr = (SQLUSMALLINT *)value_ptr;
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_USE_BOOKMARKS:
+        /* Enable/disable bookmark support. This driver serves a fully-buffered
+         * static result set, so a bookmark is simply the (1-based) row index;
+         * SQL_UB_ON (fixed-length) and SQL_UB_VARIABLE are handled identically. */
+        if (value_as_ulen == SQL_UB_OFF ||
+            value_as_ulen == SQL_UB_ON ||
+            value_as_ulen == SQL_UB_VARIABLE) {
+            statement->use_bookmarks = value_as_ulen;
+            return SQL_SUCCESS;
+        }
+        diagnostics_add_record(&statement->diagnostics,
+                               "HY092",  /* Invalid attribute/option identifier */
+                               0,
+                               "Invalid value for SQL_ATTR_USE_BOOKMARKS.");
+        return SQL_ERROR;
+
+    case SQL_ATTR_FETCH_BOOKMARK_PTR:
+        /* Store the application pointer that SQL_FETCH_BOOKMARK positions
+         * relative to. The value it points at is read at fetch time. */
+        statement->fetch_bookmark_ptr = value_ptr;
         return SQL_SUCCESS;
 
     case SQL_ATTR_QUERY_TIMEOUT:
@@ -2781,6 +2921,24 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLUSMALLINT *);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_USE_BOOKMARKS:
+        if (value_ptr) {
+            *(SQLULEN *)value_ptr = statement->use_bookmarks;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_FETCH_BOOKMARK_PTR:
+        if (value_ptr) {
+            *(SQLPOINTER *)value_ptr = statement->fetch_bookmark_ptr;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLPOINTER);
         }
         return SQL_SUCCESS;
 
@@ -3148,6 +3306,13 @@ SQLColAttribute(SQLHSTMT     statement_handle,
     }
 
     int total_columns = PQnfields(metadata_source);
+
+    /* For an updatable cursor, the trailing ctid column we appended is hidden
+     * from the application, so column-count queries report the public count. */
+    if (statement->hidden_ctid_column_index != NO_HIDDEN_CTID_COLUMN &&
+        metadata_source == statement->current_result) {
+        total_columns = statement_public_column_count(statement);
+    }
 
     /* SQL_DESC_COUNT is special — it doesn't require a valid column_number */
     if (field_identifier == SQL_DESC_COUNT) {

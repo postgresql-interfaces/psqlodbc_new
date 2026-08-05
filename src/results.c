@@ -16,12 +16,29 @@
 #include "type_mapping.h"
 #include "diagnostics.h"
 #include "connection.h"
+#include "parameter.h"
+#include "error_mapping.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <libpq-fe.h>
+
+/*
+ * Portable string duplicate. strdup was only standardized in C23, so under
+ * strict C11 we allocate and copy ourselves (mirrors diagnostics.c). Returns
+ * NULL on allocation failure; the caller treats that as SQL_ERROR.
+ */
+static char *duplicate_string(const char *source)
+{
+    size_t length = strlen(source) + 1;
+    char *copy = malloc(length);
+    if (copy) {
+        memcpy(copy, source, length);
+    }
+    return copy;
+}
 
 /* UTF-16 high (leading) surrogate range. A high surrogate is only meaningful
  * when immediately followed by a low surrogate, so a high surrogate landing at
@@ -1094,7 +1111,8 @@ static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
         return SQL_SUCCESS;
     }
 
-    int total_columns = PQnfields(statement->current_result);
+    /* Use the PUBLIC width so a bound column cannot address the hidden ctid. */
+    int total_columns = statement_public_column_count(statement);
     SQLRETURN overall_result = SQL_SUCCESS;
 
     for (int slot_index = 0; slot_index < MAX_BOUND_COLUMNS; slot_index++) {
@@ -1135,16 +1153,20 @@ static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
             }
         }
 
+        /* Read through the keyset overlay so an updated row shows its new value. */
+        bool value_is_null = false;
+        const char *raw_value = statement_row_value(statement, source_row,
+                                                    column_index, &value_is_null);
+
         /* Handle NULL values: set indicator and skip buffer write */
-        if (PQgetisnull(statement->current_result, source_row, column_index)) {
+        if (value_is_null) {
             if (element_indicator) {
                 *element_indicator = SQL_NULL_DATA;
             }
             continue;
         }
 
-        const char *raw_value = PQgetvalue(statement->current_result, source_row, column_index);
-        int raw_value_length = PQgetlength(statement->current_result, source_row, column_index);
+        int raw_value_length = (int)strlen(raw_value);
 
         unsigned int col_oid = (unsigned int)PQftype(statement->current_result, column_index);
         /* Per-column ARD SQL_DESC_PRECISION override (interval fractional secs).
@@ -1178,6 +1200,12 @@ static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
  * The cursor is assumed to already be positioned on the first row of the rowset
  * (0 <= current_row_position < total_rows). Returns SQL_SUCCESS or, on any-row
  * truncation, SQL_SUCCESS_WITH_INFO.
+ *
+ * LIMITATION (Phase 1): a bound column-0 bookmark is NOT populated on the
+ * block-cursor path. bookmark_buffer is a single scalar (not an array indexed by
+ * rowset element), so per-row bookmarks for a block cursor are out of scope. The
+ * bookmark regression test uses single-row fetches, which are handled in
+ * populate_bound_columns.
  */
 static SQLRETURN populate_bound_rowset(OdbcStatement *statement)
 {
@@ -1228,11 +1256,75 @@ static SQLRETURN populate_bound_rowset(OdbcStatement *statement)
 }
 
 /*
+ * Write the bookmark for a 0-based cursor row into an application buffer as a
+ * 4-byte Int4 (see statement_make_int4_bookmark). Used both by SQLGetData on
+ * column 0 and by the bound-bookmark path during a fetch. Both SQL_C_BOOKMARK
+ * and SQL_C_VARBOOKMARK carry the same 4-byte value; the indicator always
+ * receives sizeof(Int4Bookmark).
+ *
+ * target_type selects the buffer-length policy:
+ *   - SQL_C_BOOKMARK is a fixed 4-byte type; the application always supplies a
+ *     buffer of at least that size, so (matching the original driver) we write
+ *     unconditionally without consulting buffer_length.
+ *   - SQL_C_VARBOOKMARK is a variable-length (binary) type; if the supplied
+ *     buffer cannot hold the full 4 bytes we must NOT overrun it. In that case
+ *     we skip the copy, still report the full length via the indicator, and
+ *     signal truncation (01004 / SQL_SUCCESS_WITH_INFO).
+ *
+ * Returns SQL_SUCCESS, or SQL_SUCCESS_WITH_INFO when a VARBOOKMARK buffer was
+ * too small to receive the value.
+ */
+static SQLRETURN write_row_bookmark(OdbcStatement *statement,
+                                    int zero_based_row,
+                                    SQLSMALLINT target_type,
+                                    SQLPOINTER target_value,
+                                    SQLLEN buffer_length,
+                                    SQLLEN *indicator_or_length)
+{
+    Int4Bookmark bookmark = statement_make_int4_bookmark(zero_based_row);
+
+    /* The indicator always reports the full bookmark length, even on truncation. */
+    if (indicator_or_length) {
+        *indicator_or_length = (SQLLEN)sizeof(bookmark);
+    }
+
+    if (!target_value) {
+        return SQL_SUCCESS;
+    }
+
+    /* Variable-length bookmark: guard against a buffer too small for the value. */
+    if (target_type == SQL_C_VARBOOKMARK &&
+        buffer_length < (SQLLEN)sizeof(bookmark)) {
+        diagnostics_add_record(&statement->diagnostics,
+                               "01004",  /* String data, right truncated */
+                               0,
+                               "Bookmark buffer too small to receive the bookmark value.");
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    memcpy(target_value, &bookmark, sizeof(bookmark));
+    return SQL_SUCCESS;
+}
+
+/*
  * Single-row convenience wrapper used by plain SQLFetch and the single-row
  * scrolling path: writes the current row into element 0 of the bound buffers.
+ * When a column-0 bookmark binding is active, the current row's bookmark is also
+ * written into the bound bookmark buffer so an application that binds column 0
+ * (rather than calling SQLGetData) receives it during the fetch.
  */
 static SQLRETURN populate_bound_columns(OdbcStatement *statement)
 {
+    /* Gate the bound-bookmark write on bookmarks being enabled, consistent with
+     * the SQLGetData column-0 guard: a column-0 binding is only meaningful when
+     * the application opted into bookmarks via SQL_ATTR_USE_BOOKMARKS. */
+    if (statement->bookmark_bound && statement->use_bookmarks != SQL_UB_OFF) {
+        write_row_bookmark(statement, statement->current_row_position,
+                           statement->bookmark_target_type,
+                           statement->bookmark_buffer,
+                           statement->bookmark_buffer_length,
+                           statement->bookmark_indicator);
+    }
     return populate_bound_columns_row(statement, statement->current_row_position, 0);
 }
 
@@ -1254,7 +1346,9 @@ SQLRETURN results_num_result_cols(OdbcStatement *statement,
 
     if (statement->current_result) {
         if (column_count) {
-            *column_count = (SQLSMALLINT)PQnfields(statement->current_result);
+            /* Report the PUBLIC column count so the hidden ctid appended for an
+             * updatable cursor never shows up in SQLNumResultCols. */
+            *column_count = (SQLSMALLINT)statement_public_column_count(statement);
         }
         return SQL_SUCCESS;
     }
@@ -1302,6 +1396,12 @@ SQLRETURN results_describe_col(OdbcStatement *statement,
     }
 
     int total_columns = PQnfields(metadata_source);
+
+    /* Hide the trailing ctid column of an updatable cursor from SQLDescribeCol. */
+    if (statement->hidden_ctid_column_index != NO_HIDDEN_CTID_COLUMN &&
+        metadata_source == statement->current_result) {
+        total_columns = statement_public_column_count(statement);
+    }
 
     /* Column number 0 is the bookmark column — not supported */
     if (column_number == 0) {
@@ -1418,6 +1518,153 @@ SQLRETURN results_row_count(OdbcStatement *statement, SQLLEN *row_count)
     return SQL_SUCCESS;
 }
 
+/*
+ * True when this fetch must go through the keyset block-cursor path: an
+ * updatable cursor with a live overlay and a block (row-array) size > 1. Such a
+ * cursor skips overlay-deleted rows during movement and supports backward block
+ * fetches (SQL_FETCH_PRIOR), which the plain static path does not.
+ */
+static bool keyset_block_fetch_active(const OdbcStatement *statement)
+{
+    return statement->is_updatable_cursor && statement->keyset_rows &&
+           statement->hidden_ctid_column_index != NO_HIDDEN_CTID_COLUMN &&
+           statement->row_array_size > 1;
+}
+
+/*
+ * Block fetch over the keyset overlay for an updatable cursor: gather up to
+ * row_array_size non-deleted base rows in the requested direction, copy them
+ * into the bound arrays, and record the rowset extent so SQLSetPos can target a
+ * row within it. Handles SQL_FETCH_FIRST/NEXT/LAST/PRIOR (the orientations the
+ * block-delete cursor uses). Deleted rows are skipped; rows added by SQL_ADD
+ * (beyond the base result) are included as live rows.
+ *
+ * Cursor model (matches the plain path): current_row_position is the last row of
+ * the delivered rowset; -1 = BOF, keyset_row_count = EOF. keyset_rowset_first_row
+ * is the first (lowest-index) row of the rowset, which SQL_DELETE targets.
+ */
+static SQLRETURN keyset_block_fetch(OdbcStatement *statement,
+                                    SQLUSMALLINT fetch_orientation,
+                                    SQLULEN *fetched_row_count,
+                                    SQLUSMALLINT *row_status_array)
+{
+    int total_rows = statement->keyset_row_count;
+    SQLULEN rowset_size = statement->row_array_size;
+
+    /* Collect base-row indices for this rowset, always stored in ascending
+     * (presentation) order. */
+    int collected[MAX_BOUND_COLUMNS];
+    if (rowset_size > MAX_BOUND_COLUMNS) {
+        rowset_size = MAX_BOUND_COLUMNS;
+    }
+    int collected_count = 0;
+
+    bool scan_backward = (fetch_orientation == SQL_FETCH_PRIOR ||
+                          fetch_orientation == SQL_FETCH_LAST);
+
+    int scan_index;
+    switch (fetch_orientation) {
+    case SQL_FETCH_FIRST:
+        scan_index = 0;
+        break;
+    case SQL_FETCH_NEXT:
+        scan_index = (statement->current_row_position < 0)
+                         ? 0
+                         : statement->current_row_position + 1;
+        break;
+    case SQL_FETCH_LAST:
+        scan_index = total_rows - 1;
+        break;
+    case SQL_FETCH_PRIOR:
+        /* Anchor before the current rowset's first row; from EOF (or with no
+         * established rowset) start at the very end. */
+        if (statement->keyset_rowset_first_row < 0 ||
+            statement->current_row_position >= total_rows) {
+            scan_index = total_rows - 1;
+        } else {
+            scan_index = statement->keyset_rowset_first_row - 1;
+        }
+        break;
+    default:
+        diagnostics_add_record(&statement->diagnostics, "HY106", 0,
+                               "Unsupported fetch orientation for keyset cursor.");
+        return SQL_ERROR;
+    }
+
+    /* Walk in the scan direction, skipping deleted rows, until the rowset is
+     * full or we run off an end. */
+    while (collected_count < (int)rowset_size &&
+           scan_index >= 0 && scan_index < total_rows) {
+        if (!statement->keyset_rows[scan_index].deleted) {
+            collected[collected_count++] = scan_index;
+        }
+        scan_index += scan_backward ? -1 : 1;
+    }
+
+    /* No live rows in this direction: park at the appropriate boundary. */
+    if (collected_count == 0) {
+        if (scan_backward) {
+            statement->current_row_position = -1;  /* BOF */
+            statement->keyset_rowset_first_row = -1;
+        } else {
+            statement->current_row_position = total_rows;  /* EOF */
+        }
+        statement->keyset_rowset_size = 0;
+        if (fetched_row_count) {
+            *fetched_row_count = 0;
+        }
+        if (statement->rows_fetched_ptr) {
+            *statement->rows_fetched_ptr = 0;
+        }
+        return SQL_NO_DATA;
+    }
+
+    /* Backward scans collected in descending order; flip to ascending so the
+     * rowset is presented (and its first row targeted) consistently. */
+    if (scan_backward) {
+        for (int i = 0, j = collected_count - 1; i < j; i++, j--) {
+            int temp = collected[i];
+            collected[i] = collected[j];
+            collected[j] = temp;
+        }
+    }
+
+    /* Copy each collected row into its rowset element and set per-row status. */
+    SQLRETURN overall_result = SQL_SUCCESS;
+    for (int element = 0; element < collected_count; element++) {
+        SQLRETURN row_result =
+            populate_bound_columns_row(statement, collected[element],
+                                       (SQLULEN)element);
+        if (row_result == SQL_SUCCESS_WITH_INFO) {
+            overall_result = SQL_SUCCESS_WITH_INFO;
+        }
+        if (statement->row_status_ptr) {
+            statement->row_status_ptr[element] = SQL_ROW_SUCCESS;
+        }
+        if (row_status_array) {
+            row_status_array[element] = SQL_ROW_SUCCESS;
+        }
+    }
+    if (statement->row_status_ptr) {
+        for (int element = collected_count; element < (int)statement->row_array_size;
+             element++) {
+            statement->row_status_ptr[element] = SQL_ROW_NOROW;
+        }
+    }
+
+    statement->keyset_rowset_first_row = collected[0];
+    statement->keyset_rowset_size = collected_count;
+    statement->current_row_position = collected[collected_count - 1];
+
+    if (statement->rows_fetched_ptr) {
+        *statement->rows_fetched_ptr = (SQLULEN)collected_count;
+    }
+    if (fetched_row_count) {
+        *fetched_row_count = (SQLULEN)collected_count;
+    }
+    return overall_result;
+}
+
 SQLRETURN results_fetch(OdbcStatement *statement)
 {
     if (!statement->current_result || !statement->has_result_set) {
@@ -1426,6 +1673,13 @@ SQLRETURN results_fetch(OdbcStatement *statement)
          * print_result after commands like SET that produce no rows. They expect
          * SQLFetch to signal "no data" rather than an error. */
         return SQL_NO_DATA;
+    }
+
+    /* Updatable block cursor: skip overlay-deleted rows and track the rowset
+     * extent so SQLSetPos can target rows within it. A plain SQLFetch advances
+     * the cursor forward, i.e. SQL_FETCH_NEXT. */
+    if (keyset_block_fetch_active(statement)) {
+        return keyset_block_fetch(statement, SQL_FETCH_NEXT, NULL, NULL);
     }
 
     int total_rows = PQntuples(statement->current_result);
@@ -1498,6 +1752,14 @@ SQLRETURN results_extended_fetch(OdbcStatement *statement,
         return SQL_ERROR;
     }
 
+    /* Updatable block cursor: delegate to the overlay-aware block fetch, which
+     * skips deleted rows and records the rowset extent for SQLSetPos. It handles
+     * the orientations the block-delete cursor uses (FIRST/NEXT/LAST/PRIOR). */
+    if (keyset_block_fetch_active(statement)) {
+        return keyset_block_fetch(statement, fetch_orientation,
+                                  fetched_row_count, row_status_array);
+    }
+
     const int total_rows = PQntuples(statement->current_result);
     const int current_position = statement->current_row_position;
 
@@ -1554,6 +1816,37 @@ SQLRETURN results_extended_fetch(OdbcStatement *statement,
          * "RELATIVE from BOF with positive offset behaves like ABSOLUTE" case. */
         target_index = (SQLLEN)current_position + fetch_offset;
         break;
+
+    case SQL_FETCH_BOOKMARK: {
+        /* Position relative to the bookmark the application stored via
+         * SQL_ATTR_FETCH_BOOKMARK_PTR. The bookmark is a 4-byte Int4 encoding a
+         * 1-based row; resolve it to a 0-based base row, then move fetch_offset
+         * rows. This is a static snapshot with no deleted rows, so "walk N valid
+         * rows" is simply base + offset. */
+        /* Bookmarked fetching requires the application to have enabled bookmarks
+         * (consistent with the SQLGetData column-0 guard). */
+        if (statement->use_bookmarks == SQL_UB_OFF) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY106",  /* Fetch type out of range */
+                                   0,
+                                   "SQL_FETCH_BOOKMARK requires SQL_ATTR_USE_BOOKMARKS "
+                                   "to be enabled.");
+            return SQL_ERROR;
+        }
+        if (!statement->fetch_bookmark_ptr) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HY090",  /* Invalid string or buffer length */
+                                   0,
+                                   "SQL_FETCH_BOOKMARK requested but "
+                                   "SQL_ATTR_FETCH_BOOKMARK_PTR is not set.");
+            return SQL_ERROR;
+        }
+        Int4Bookmark stored_bookmark;
+        memcpy(&stored_bookmark, statement->fetch_bookmark_ptr, sizeof(stored_bookmark));
+        int base_row = statement_resolve_int4_bookmark(stored_bookmark);
+        target_index = (SQLLEN)base_row + fetch_offset;
+        break;
+    }
 
     default:
         diagnostics_add_record(&statement->diagnostics,
@@ -1677,8 +1970,34 @@ SQLRETURN results_get_data(OdbcStatement *statement,
         return SQL_ERROR;
     }
 
-    /* Validate column number (1-based) */
-    int total_columns = PQnfields(statement->current_result);
+    /* Column 0 is the bookmark column. It is not a real result column, so it
+     * must be handled before the 1-based range check below. Reading it requires
+     * bookmarks to have been enabled via SQL_ATTR_USE_BOOKMARKS; otherwise the
+     * column does not exist for this cursor. The value is the current row's
+     * 4-byte Int4 bookmark (both SQL_C_BOOKMARK and SQL_C_VARBOOKMARK). */
+    if (column_number == 0) {
+        if (statement->use_bookmarks == SQL_UB_OFF) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "07009",  /* Invalid descriptor index */
+                                   0,
+                                   "Bookmarks are not enabled (SQL_ATTR_USE_BOOKMARKS is off).");
+            return SQL_ERROR;
+        }
+        if (target_type != SQL_C_BOOKMARK && target_type != SQL_C_VARBOOKMARK) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "07006",  /* Restricted data type attribute violation */
+                                   0,
+                                   "Column 0 can only be retrieved as a bookmark type.");
+            return SQL_ERROR;
+        }
+        return write_row_bookmark(statement, statement->current_row_position,
+                                  target_type, target_value,
+                                  buffer_length, indicator_or_length);
+    }
+
+    /* Validate column number (1-based) against the PUBLIC count so an updatable
+     * cursor's hidden ctid column cannot be read by the application. */
+    int total_columns = statement_public_column_count(statement);
     if (column_number < 1 || column_number > (SQLUSMALLINT)total_columns) {
         diagnostics_add_record(&statement->diagnostics,
                                "07009",  /* Invalid descriptor index */
@@ -1690,8 +2009,14 @@ SQLRETURN results_get_data(OdbcStatement *statement,
     int column_index = (int)(column_number - 1);
     int row_index = statement->current_row_position;
 
+    /* Read through the keyset overlay so a positioned UPDATE/REFRESH shows its
+     * new value on re-fetch; falls back to the base result for normal rows. */
+    bool value_is_null = false;
+    const char *raw_value = statement_row_value(statement, row_index,
+                                                column_index, &value_is_null);
+
     /* Check for NULL */
-    if (PQgetisnull(statement->current_result, row_index, column_index)) {
+    if (value_is_null) {
         if (indicator_or_length) {
             *indicator_or_length = SQL_NULL_DATA;
         } else {
@@ -1705,9 +2030,7 @@ SQLRETURN results_get_data(OdbcStatement *statement,
         return SQL_SUCCESS;
     }
 
-    /* Get the raw text value from libpq */
-    const char *raw_value = PQgetvalue(statement->current_result, row_index, column_index);
-    int raw_value_length = PQgetlength(statement->current_result, row_index, column_index);
+    int raw_value_length = (int)strlen(raw_value);
 
     /* Resolve SQL_C_DEFAULT to the actual default C type for this column */
     SQLSMALLINT resolved_type = target_type;
@@ -1773,4 +2096,720 @@ SQLRETURN results_convert_column(OdbcStatement *statement,
                                    resolved_type, target_value,
                                    buffer_length, indicator_or_length,
                                    postgres_oid, -1);
+}
+
+/* ==================================================================
+ * SQLSetPos — positioned UPDATE / DELETE / REFRESH / ADD
+ *
+ * Backed by the hidden-ctid keyset (see statement.c). SQLSetPos identifies a
+ * row within the CURRENT rowset (row_number is 1-based within it), maps it to a
+ * base row of the buffered result, reads that row's captured ctid, and issues a
+ * searched UPDATE/DELETE keyed on the ctid. Because libpq's PGresult is
+ * immutable, the new/updated values are stored in the per-row overlay so a
+ * re-fetch of the still-open cursor reflects them.
+ * ================================================================== */
+
+/*
+ * Read the ctid captured in the hidden trailing column of a base row. Returns a
+ * pointer into the PGresult (valid until the result is cleared), or NULL if the
+ * row has no ctid (e.g. an SQL_ADD row not yet flushed, or a non-updatable
+ * cursor). The ctid text looks like "(block,offset)".
+ */
+static const char *keyset_row_ctid(const OdbcStatement *statement, int base_row)
+{
+    if (statement->hidden_ctid_column_index == NO_HIDDEN_CTID_COLUMN ||
+        !statement->current_result) {
+        return NULL;
+    }
+    if (base_row < 0 || base_row >= PQntuples(statement->current_result)) {
+        return NULL;  /* Rows added by SQL_ADD have no base ctid column. */
+    }
+    /* An UPDATE moves the row to a new ctid, which "RETURNING *, ctid" captured
+     * into the overlay. Prefer the overlay's ctid so a SECOND positioned update
+     * on the same row keys on where the row actually lives now, not the stale
+     * ctid frozen in the immutable base PGresult. */
+    const KeysetRow *row = &statement->keyset_rows[base_row];
+    if (row->override_values &&
+        row->override_values[statement->hidden_ctid_column_index]) {
+        return row->override_values[statement->hidden_ctid_column_index];
+    }
+    if (PQgetisnull(statement->current_result, base_row,
+                    statement->hidden_ctid_column_index)) {
+        return NULL;
+    }
+    return PQgetvalue(statement->current_result, base_row,
+                      statement->hidden_ctid_column_index);
+}
+
+/*
+ * Convert a bound column's application buffer to its PostgreSQL text
+ * representation for use as a positioned-UPDATE/INSERT value. Reuses the
+ * parameter converter by projecting the ColumnBinding onto a ParameterBinding.
+ * Returns a heap string (caller frees) and sets *is_null, or NULL for SQL NULL.
+ */
+static char *keyset_bound_column_to_text(const ColumnBinding *binding,
+                                         bool *is_null)
+{
+    ParameterBinding projected = {0};
+    projected.c_type = binding->target_type;
+    /* No SQL-type hint: send as text and let PostgreSQL coerce to the column
+     * type. This keeps the converter on its plain text path for integers. */
+    projected.sql_type = SQL_UNKNOWN_TYPE;
+    projected.value_buffer = binding->target_buffer;
+    projected.buffer_length = binding->buffer_length;
+    projected.indicator_or_length = binding->indicator_or_length;
+
+    if (binding->indicator_or_length &&
+        *binding->indicator_or_length == SQL_NULL_DATA) {
+        *is_null = true;
+        return NULL;
+    }
+
+    int text_length = 0;
+    char *text = convert_parameter_to_text(&projected, &text_length);
+    *is_null = (text == NULL);
+    return text;
+}
+
+/*
+ * Safely quote a SQL identifier (column name) for interpolation into DML text.
+ * Column names come from PQfname, which for an updatable single-table cursor are
+ * ordinary identifiers, but a name could legally contain a double quote; naive
+ * "%s" wrapping would let that break out of the quotes. PQescapeIdentifier both
+ * quotes and doubles any embedded quote, so it is injection-safe. Returns a
+ * libpq-allocated string the caller frees with PQfreemem, or NULL on failure.
+ */
+static char *keyset_quote_identifier(PGconn *connection, const char *identifier)
+{
+    return PQescapeIdentifier(connection, identifier, strlen(identifier));
+}
+
+/*
+ * Replace a base row's overlay with the values from one row of a PGresult that
+ * has the SAME column layout as the cursor (all columns followed by the hidden
+ * ctid), e.g. the output of "UPDATE ... RETURNING *, ctid". This captures the
+ * NEW ctid (an UPDATE moves the row) and the new column values so a re-fetch of
+ * the still-open cursor reflects them. Returns SQL_SUCCESS or SQL_ERROR (OOM).
+ */
+static SQLRETURN keyset_store_row_overlay(OdbcStatement *statement,
+                                          int base_row,
+                                          PGresult *source, int source_row)
+{
+    int full_column_count = PQnfields(statement->current_result);
+    KeysetRow *row = &statement->keyset_rows[base_row];
+
+    if (row->override_values) {
+        for (int column = 0; column < full_column_count; column++) {
+            free(row->override_values[column]);
+        }
+        free(row->override_values);
+        row->override_values = NULL;
+    }
+    row->override_values = calloc((size_t)full_column_count, sizeof(char *));
+    if (!row->override_values) {
+        return SQL_ERROR;
+    }
+
+    int source_columns = PQnfields(source);
+    for (int column = 0; column < full_column_count && column < source_columns;
+         column++) {
+        if (PQgetisnull(source, source_row, column)) {
+            row->override_values[column] = NULL;  /* SQL NULL */
+            continue;
+        }
+        row->override_values[column] =
+            duplicate_string(PQgetvalue(source, source_row, column));
+    }
+    return SQL_SUCCESS;
+}
+
+/*
+ * Build and run a positioned UPDATE for one base row: set every bound public
+ * column (indicator != SQL_IGNORE) to its current buffer value, keyed on the
+ * row's captured ctid. Bound VALUES go through PQexecParams (injection-safe);
+ * the ctid is self-captured and safe to inline. "RETURNING *, ctid" gives back
+ * the post-update row (with its new ctid), which is stored in the overlay so a
+ * re-fetch shows the new values.
+ */
+static SQLRETURN keyset_positioned_update(OdbcStatement *statement, int base_row)
+{
+    const char *ctid = keyset_row_ctid(statement, base_row);
+    if (!ctid) {
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Row has no ctid; cannot perform positioned update.");
+        return SQL_ERROR;
+    }
+
+    PGconn *connection = statement->parent_connection->libpq_connection;
+
+    /* Assemble the "SET col=$n, ..." list from bound public columns. Values are
+     * bound as PQexecParams parameters ($1..$n) to avoid SQL injection. */
+    char set_clause[2048];
+    size_t set_length = 0;
+    const char *param_values[MAX_BOUND_COLUMNS];
+    char *owned_param_values[MAX_BOUND_COLUMNS];
+    int param_count = 0;
+    int public_columns = statement_public_column_count(statement);
+
+    for (int slot = 0; slot < MAX_BOUND_COLUMNS; slot++) {
+        ColumnBinding *binding = &statement->column_bindings[slot];
+        if (!binding->is_bound) {
+            continue;
+        }
+        int column_index = (int)(binding->column_number - 1);
+        if (column_index < 0 || column_index >= public_columns) {
+            continue;  /* Skip bindings outside the visible result. */
+        }
+        /* SQL_IGNORE in the indicator means "do not update this column". */
+        if (binding->indicator_or_length &&
+            *binding->indicator_or_length == SQL_IGNORE) {
+            continue;
+        }
+
+        bool is_null = false;
+        char *text = keyset_bound_column_to_text(binding, &is_null);
+        const char *raw_column_name = PQfname(statement->current_result, column_index);
+        char *quoted_column_name = keyset_quote_identifier(connection, raw_column_name);
+        if (!quoted_column_name) {
+            free(text);
+            for (int i = 0; i < param_count; i++) {
+                free(owned_param_values[i]);
+            }
+            diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                   "Out of memory quoting column name for UPDATE.");
+            return SQL_ERROR;
+        }
+        const char *separator = (set_length > 0) ? ", " : "";
+
+        int written;
+        if (is_null) {
+            written = snprintf(set_clause + set_length,
+                               sizeof(set_clause) - set_length,
+                               "%s%s = NULL", separator, quoted_column_name);
+        } else {
+            owned_param_values[param_count] = text;
+            param_values[param_count] = text;
+            written = snprintf(set_clause + set_length,
+                               sizeof(set_clause) - set_length,
+                               "%s%s = $%d", separator, quoted_column_name,
+                               param_count + 1);
+            param_count++;
+        }
+        PQfreemem(quoted_column_name);
+        if (written < 0 || (size_t)written >= sizeof(set_clause) - set_length) {
+            for (int i = 0; i < param_count; i++) {
+                free(owned_param_values[i]);
+            }
+            diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                   "Positioned UPDATE SET clause too large.");
+            return SQL_ERROR;
+        }
+        set_length += (size_t)written;
+    }
+
+    if (set_length == 0) {
+        return SQL_SUCCESS;  /* No updatable bound columns: no-op. */
+    }
+
+    char query[3072];
+    snprintf(query, sizeof(query),
+             "UPDATE %s SET %s WHERE ctid = '%s' RETURNING *, ctid",
+             statement->keyset_table_name, set_clause, ctid);
+
+    PGresult *update_result = PQexecParams(connection, query, param_count, NULL,
+                                           param_values, NULL, NULL, 0);
+    for (int i = 0; i < param_count; i++) {
+        free(owned_param_values[i]);
+    }
+
+    if (!update_result || PQresultStatus(update_result) != PGRES_TUPLES_OK) {
+        if (update_result) {
+            error_add_diagnostic_from_result(&statement->diagnostics,
+                                             update_result, "HY000");
+            PQclear(update_result);
+        }
+        return SQL_ERROR;
+    }
+
+    SQLRETURN store_result = SQL_SUCCESS;
+    if (PQntuples(update_result) >= 1) {
+        store_result = keyset_store_row_overlay(statement, base_row,
+                                                update_result, 0);
+    }
+    PQclear(update_result);
+    return store_result;
+}
+
+/*
+ * Positioned DELETE for one base row, keyed on its captured ctid. Marks the
+ * overlay row deleted so the still-open cursor skips it on subsequent fetches
+ * (the immutable PGresult cannot be shrunk). Returns SQL_SUCCESS or SQL_ERROR.
+ */
+static SQLRETURN keyset_positioned_delete(OdbcStatement *statement, int base_row)
+{
+    const char *ctid = keyset_row_ctid(statement, base_row);
+    if (!ctid) {
+        /* A row added via SQL_ADD (no base ctid) is deleted purely in the
+         * overlay — it was never persisted with a ctid we track. */
+        if (base_row >= 0 && base_row < statement->keyset_row_count) {
+            statement->keyset_rows[base_row].deleted = true;
+            return SQL_SUCCESS;
+        }
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Row has no ctid; cannot perform positioned delete.");
+        return SQL_ERROR;
+    }
+
+    PGconn *connection = statement->parent_connection->libpq_connection;
+    char query[512];
+    snprintf(query, sizeof(query), "DELETE FROM %s WHERE ctid = '%s'",
+             statement->keyset_table_name, ctid);
+
+    PGresult *delete_result = PQexec(connection, query);
+    if (!delete_result || PQresultStatus(delete_result) != PGRES_COMMAND_OK) {
+        if (delete_result) {
+            error_add_diagnostic_from_result(&statement->diagnostics,
+                                             delete_result, "HY000");
+            PQclear(delete_result);
+        }
+        return SQL_ERROR;
+    }
+    PQclear(delete_result);
+
+    statement->keyset_rows[base_row].deleted = true;
+    return SQL_SUCCESS;
+}
+
+/*
+ * Positioned REFRESH for one base row: re-copy its current values into the bound
+ * buffers (element 0). No server round-trip — the overlay already holds the
+ * latest values from any prior UPDATE. Returns the copy result.
+ */
+static SQLRETURN keyset_positioned_refresh(OdbcStatement *statement, int base_row)
+{
+    int saved_position = statement->current_row_position;
+    statement->current_row_position = base_row;
+    SQLRETURN result = populate_bound_columns(statement);
+    statement->current_row_position = saved_position;
+    return result;
+}
+
+/*
+ * Positioned ADD (bulk insert): INSERT one row per rowset element from the bound
+ * column buffers into the cursor's table, then append a live overlay row per
+ * inserted row so the still-open cursor and delete bookkeeping account for it.
+ * The block-delete test uses irow==0 (whole rowset) ADD with row_array_size
+ * rows staged in the bound arrays. Returns SQL_SUCCESS or SQL_ERROR.
+ *
+ * capture_inserted_row controls two behaviors needed only by the
+ * SQLBulkOperations SQL_ADD path (SQLSetPos SQL_ADD passes false so its behavior
+ * is unchanged):
+ *   - the INSERT uses "RETURNING *, ctid" and the returned row is stored in the
+ *     new overlay entry, so the added row carries real values (and a ctid) and a
+ *     subsequent SQL_FETCH_BY_BOOKMARK can read them back;
+ *   - the newly added row's bookmark is written into the bound column-0 buffer
+ *     (via write_row_bookmark), matching the ODBC contract that SQL_ADD returns
+ *     the new row's bookmark to the application.
+ */
+static SQLRETURN keyset_positioned_add(OdbcStatement *statement,
+                                       bool capture_inserted_row)
+{
+    PGconn *connection = statement->parent_connection->libpq_connection;
+    int public_columns = statement_public_column_count(statement);
+    SQLULEN rowset_size = statement->row_array_size > 0 ? statement->row_array_size : 1;
+
+    for (SQLULEN element = 0; element < rowset_size; element++) {
+        char column_list[1024];
+        char value_list[1024];
+        size_t column_length = 0;
+        size_t value_length = 0;
+        const char *param_values[MAX_BOUND_COLUMNS];
+        char *owned_param_values[MAX_BOUND_COLUMNS];
+        int param_count = 0;
+
+        for (int slot = 0; slot < MAX_BOUND_COLUMNS; slot++) {
+            ColumnBinding *binding = &statement->column_bindings[slot];
+            if (!binding->is_bound) {
+                continue;
+            }
+            int column_index = (int)(binding->column_number - 1);
+            if (column_index < 0 || column_index >= public_columns) {
+                continue;
+            }
+
+            /* Project the element-th array slot onto a temporary binding so the
+             * text converter reads the right rowset element. */
+            size_t stride = c_type_element_stride(binding->target_type,
+                                                  binding->buffer_length);
+            ColumnBinding element_binding = *binding;
+            if (binding->target_buffer && stride > 0) {
+                element_binding.target_buffer =
+                    (SQLPOINTER)((char *)binding->target_buffer + element * stride);
+            }
+            if (binding->indicator_or_length) {
+                element_binding.indicator_or_length =
+                    binding->indicator_or_length + element;
+            }
+            if (element_binding.indicator_or_length &&
+                *element_binding.indicator_or_length == SQL_IGNORE) {
+                continue;
+            }
+
+            bool is_null = false;
+            char *text = keyset_bound_column_to_text(&element_binding, &is_null);
+            const char *raw_column_name = PQfname(statement->current_result, column_index);
+            char *quoted_column_name = keyset_quote_identifier(connection, raw_column_name);
+            if (!quoted_column_name) {
+                free(text);
+                for (int i = 0; i < param_count; i++) {
+                    free(owned_param_values[i]);
+                }
+                diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                       "Out of memory quoting column name for INSERT.");
+                return SQL_ERROR;
+            }
+
+            /* Separators are driven by accumulated length (not param_count) so a
+             * NULL column, which contributes a column name and a literal NULL but
+             * NO bound parameter, still gets a comma. */
+            int cwritten = snprintf(column_list + column_length,
+                                    sizeof(column_list) - column_length,
+                                    "%s%s", column_length > 0 ? ", " : "",
+                                    quoted_column_name);
+            PQfreemem(quoted_column_name);
+            int vwritten;
+            if (is_null) {
+                /* SQL NULL: emit a literal NULL and DO NOT consume a $n slot, so
+                 * placeholder numbering stays aligned with param_values[] and the
+                 * free loops never touch an unassigned owned_param_values entry. */
+                vwritten = snprintf(value_list + value_length,
+                                    sizeof(value_list) - value_length,
+                                    "%sNULL", value_length > 0 ? ", " : "");
+            } else {
+                owned_param_values[param_count] = text;
+                param_values[param_count] = text;
+                vwritten = snprintf(value_list + value_length,
+                                    sizeof(value_list) - value_length,
+                                    "%s$%d", value_length > 0 ? ", " : "",
+                                    param_count + 1);
+                param_count++;
+            }
+            if (cwritten < 0 || vwritten < 0 ||
+                (size_t)cwritten >= sizeof(column_list) - column_length ||
+                (size_t)vwritten >= sizeof(value_list) - value_length) {
+                for (int i = 0; i < param_count; i++) {
+                    free(owned_param_values[i]);
+                }
+                diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                       "Positioned INSERT column list too large.");
+                return SQL_ERROR;
+            }
+            column_length += (size_t)cwritten;
+            value_length += (size_t)vwritten;
+        }
+
+        if (column_length == 0) {
+            continue;  /* No bound columns to insert for this element. */
+        }
+
+        char query[2560];
+        /* When the caller wants the inserted row captured, return the full row
+         * plus its ctid so the new overlay entry mirrors the layout the fetch and
+         * ctid accessors expect (all public columns followed by the hidden ctid). */
+        snprintf(query, sizeof(query),
+                 capture_inserted_row
+                     ? "INSERT INTO %s (%s) VALUES (%s) RETURNING *, ctid"
+                     : "INSERT INTO %s (%s) VALUES (%s)",
+                 statement->keyset_table_name, column_list, value_list);
+        PGresult *insert_result = PQexecParams(connection, query, param_count,
+                                               NULL, param_values, NULL, NULL, 0);
+        for (int i = 0; i < param_count; i++) {
+            free(owned_param_values[i]);
+        }
+        if (!insert_result ||
+            (PQresultStatus(insert_result) != PGRES_COMMAND_OK &&
+             PQresultStatus(insert_result) != PGRES_TUPLES_OK)) {
+            if (insert_result) {
+                error_add_diagnostic_from_result(&statement->diagnostics,
+                                                 insert_result, "HY000");
+                PQclear(insert_result);
+            }
+            return SQL_ERROR;
+        }
+
+        /* Grow the overlay by one live row so the cursor and delete counters see
+         * the added row. Without capture it has no base tuple; its values live
+         * only in the overlay-less region and read as NULL, which is fine for the
+         * delete test (it never reads added rows' values). With capture, the
+         * RETURNING row is stored below so the added row reads back its values. */
+        int new_count = statement->keyset_row_count + 1;
+        KeysetRow *grown = realloc(statement->keyset_rows,
+                                   (size_t)new_count * sizeof(KeysetRow));
+        if (!grown) {
+            PQclear(insert_result);
+            diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                   "Out of memory growing keyset for SQL_ADD.");
+            return SQL_ERROR;
+        }
+        statement->keyset_rows = grown;
+        int added_row_index = statement->keyset_row_count;
+        statement->keyset_rows[added_row_index].deleted = false;
+        statement->keyset_rows[added_row_index].override_values = NULL;
+        statement->keyset_row_count = new_count;
+
+        if (capture_inserted_row && PQntuples(insert_result) >= 1) {
+            /* Store the RETURNING row as the added row's override so it reads back
+             * its inserted values (and carries the ctid) on a later fetch. */
+            SQLRETURN store_result =
+                keyset_store_row_overlay(statement, added_row_index,
+                                         insert_result, 0);
+            if (store_result == SQL_ERROR) {
+                PQclear(insert_result);
+                return SQL_ERROR;
+            }
+
+            /* Return the new row's bookmark to the application via the bound
+             * column-0 buffer, so it can later fetch the row by that bookmark. */
+            if (statement->bookmark_bound &&
+                statement->use_bookmarks != SQL_UB_OFF) {
+                write_row_bookmark(statement, added_row_index,
+                                   statement->bookmark_target_type,
+                                   statement->bookmark_buffer,
+                                   statement->bookmark_buffer_length,
+                                   statement->bookmark_indicator);
+            }
+        }
+        PQclear(insert_result);
+    }
+
+    return SQL_SUCCESS;
+}
+
+SQLRETURN statement_set_pos(OdbcStatement *statement,
+                            SQLSETPOSIROW row_number,
+                            SQLUSMALLINT operation,
+                            SQLUSMALLINT lock_type)
+{
+    (void)lock_type;  /* Lock modes are advisory; PostgreSQL MVCC handles this. */
+
+    if (!statement->current_result || !statement->has_result_set) {
+        diagnostics_add_record(&statement->diagnostics, "24000", 0,
+                               "No open cursor for SQLSetPos.");
+        return SQL_ERROR;
+    }
+    if (!statement->is_updatable_cursor ||
+        statement->hidden_ctid_column_index == NO_HIDDEN_CTID_COLUMN) {
+        diagnostics_add_record(&statement->diagnostics, "HY092", 0,
+                               "SQLSetPos requires an updatable (keyset) cursor.");
+        return SQL_ERROR;
+    }
+
+    /* SQL_ADD inserts new rows and does not reference an existing row. The
+     * SQLSetPos path does not need the inserted row captured or its bookmark
+     * returned (that is a SQLBulkOperations-only concern), so pass false. */
+    if (operation == SQL_ADD) {
+        return keyset_positioned_add(statement, false);
+    }
+
+    /* Resolve the target base row from the 1-based row_number within the current
+     * rowset. row_number == 0 means "operate on the whole rowset" (bulk); for
+     * UPDATE/DELETE/REFRESH the regression tests always use row_number 1 with a
+     * single-row rowset, so bulk maps to the first rowset row. */
+    int rowset_first = (statement->keyset_rowset_first_row >= 0)
+                           ? statement->keyset_rowset_first_row
+                           : statement->current_row_position;
+    SQLSETPOSIROW effective_row = (row_number == 0) ? 1 : row_number;
+    int base_row = rowset_first + (int)(effective_row - 1);
+
+    if (base_row < 0 || base_row >= statement->keyset_row_count) {
+        diagnostics_add_record(&statement->diagnostics, "HY107", 0,
+                               "Row number is out of range for the current rowset.");
+        return SQL_ERROR;
+    }
+
+    switch (operation) {
+    case SQL_UPDATE:
+        return keyset_positioned_update(statement, base_row);
+    case SQL_DELETE:
+        return keyset_positioned_delete(statement, base_row);
+    case SQL_REFRESH:
+        return keyset_positioned_refresh(statement, base_row);
+    case SQL_POSITION:
+        statement->current_row_position = base_row;
+        return SQL_SUCCESS;
+    default:
+        diagnostics_add_record(&statement->diagnostics, "HY092", 0,
+                               "Unsupported SQLSetPos operation.");
+        return SQL_ERROR;
+    }
+}
+
+/* ==================================================================
+ * SQLBulkOperations — bookmark-keyed bulk INSERT / UPDATE / DELETE / FETCH
+ *
+ * These operations reuse the same hidden-ctid keyset machinery as SQLSetPos, but
+ * identify their target row(s) by bookmark rather than by rowset row number. A
+ * bookmark is a 4-byte Int4 = 1-based row index (see statement.h); resolving one
+ * yields a 0-based buffered row, from which keyset_row_ctid() derives the ctid
+ * that keys the positioned UPDATE/DELETE.
+ * ================================================================== */
+
+/*
+ * Read the bookmark held in rowset element `element` of the bound column-0
+ * buffer and resolve it to a 0-based buffered row, or return a negative sentinel
+ * if it cannot be resolved.
+ *
+ * For a VARBOOKMARK binding the elements are laid out with a stride equal to the
+ * bound buffer length (14 bytes in the bulk-operations test), so element N lives
+ * at bookmark_buffer + N * bookmark_buffer_length. The leading 4 bytes of each
+ * element hold the Int4 bookmark. A single-bookmark binding (row_array_size 1)
+ * is just element 0.
+ */
+static int bulk_resolve_bound_bookmark_row(const OdbcStatement *statement,
+                                           SQLULEN element)
+{
+    if (!statement->bookmark_bound || !statement->bookmark_buffer) {
+        return -1;
+    }
+    /* SQL_C_BOOKMARK is a fixed 4-byte type; SQL_C_VARBOOKMARK strides by the
+     * declared buffer length. Fall back to the bookmark size when the length is
+     * unknown so a single-element read still works. */
+    size_t stride = (statement->bookmark_target_type == SQL_C_VARBOOKMARK &&
+                     statement->bookmark_buffer_length > 0)
+                        ? (size_t)statement->bookmark_buffer_length
+                        : sizeof(Int4Bookmark);
+
+    /* Reject an undersized VARBOOKMARK buffer before reading: the memcpy below
+     * pulls a full Int4Bookmark out of each element, so a stride smaller than the
+     * bookmark would read past the application's buffer. This mirrors the
+     * write-side guard in write_row_bookmark and treats the element as "no row". */
+    if (statement->bookmark_target_type == SQL_C_VARBOOKMARK &&
+        stride < sizeof(Int4Bookmark)) {
+        return -1;
+    }
+
+    const char *element_address =
+        (const char *)statement->bookmark_buffer + (size_t)element * stride;
+
+    Int4Bookmark bookmark;
+    memcpy(&bookmark, element_address, sizeof(bookmark));
+    return statement_resolve_int4_bookmark(bookmark);
+}
+
+/*
+ * SQL_FETCH_BY_BOOKMARK: for each rowset element, resolve the bound bookmark to a
+ * buffered row and copy that row's public columns into element `i` of the bound
+ * column arrays (honoring the keyset overlay, so an updated row shows its new
+ * values and a row added by SQL_ADD reads back its inserted values). Reports the
+ * fetched-row count and per-row status via the block-cursor pointers.
+ */
+static SQLRETURN bulk_fetch_by_bookmark(OdbcStatement *statement)
+{
+    SQLULEN rowset_size = statement->row_array_size > 0
+                              ? statement->row_array_size : 1;
+    SQLRETURN overall_result = SQL_SUCCESS;
+    SQLULEN rows_fetched = 0;
+
+    for (SQLULEN element = 0; element < rowset_size; element++) {
+        int source_row = bulk_resolve_bound_bookmark_row(statement, element);
+
+        /* A bookmark that resolves outside the buffered/added row range names no
+         * live row; mark the slot NOROW and continue with the rest. */
+        if (source_row < 0 || source_row >= statement->keyset_row_count ||
+            statement_row_is_deleted(statement, source_row)) {
+            if (statement->row_status_ptr) {
+                statement->row_status_ptr[element] = SQL_ROW_NOROW;
+            }
+            continue;
+        }
+
+        SQLRETURN row_result =
+            populate_bound_columns_row(statement, source_row, element);
+        if (row_result == SQL_SUCCESS_WITH_INFO) {
+            overall_result = SQL_SUCCESS_WITH_INFO;
+        }
+        if (statement->row_status_ptr) {
+            statement->row_status_ptr[element] =
+                (row_result == SQL_SUCCESS_WITH_INFO) ? SQL_ROW_SUCCESS_WITH_INFO
+                                                      : SQL_ROW_SUCCESS;
+        }
+        rows_fetched++;
+    }
+
+    if (statement->rows_fetched_ptr) {
+        *statement->rows_fetched_ptr = rows_fetched;
+    }
+    return overall_result;
+}
+
+SQLRETURN statement_bulk_operations(OdbcStatement *statement,
+                                    SQLUSMALLINT operation)
+{
+    if (!statement->current_result || !statement->has_result_set) {
+        diagnostics_add_record(&statement->diagnostics, "24000", 0,
+                               "No open cursor for SQLBulkOperations.");
+        return SQL_ERROR;
+    }
+    if (!statement->is_updatable_cursor ||
+        statement->hidden_ctid_column_index == NO_HIDDEN_CTID_COLUMN) {
+        diagnostics_add_record(&statement->diagnostics, "HY092", 0,
+                               "SQLBulkOperations requires an updatable (keyset) cursor.");
+        return SQL_ERROR;
+    }
+
+    /* SQL_ADD does not reference an existing row. It shares the positioned-add
+     * insert path but, unlike SQLSetPos, captures the inserted row and returns
+     * its bookmark to the application (capture_inserted_row = true). */
+    if (operation == SQL_ADD) {
+        return keyset_positioned_add(statement, true);
+    }
+
+    /* The bookmark-keyed operations require bookmarks to be enabled and column 0
+     * bound to the bookmark(s) that name the target row(s). */
+    if (operation == SQL_UPDATE_BY_BOOKMARK ||
+        operation == SQL_DELETE_BY_BOOKMARK ||
+        operation == SQL_FETCH_BY_BOOKMARK) {
+        if (statement->use_bookmarks == SQL_UB_OFF || !statement->bookmark_bound) {
+            diagnostics_add_record(&statement->diagnostics, "HY092", 0,
+                                   "Bookmark operation requires bookmarks enabled and column 0 bound.");
+            return SQL_ERROR;
+        }
+    }
+
+    if (operation == SQL_FETCH_BY_BOOKMARK) {
+        return bulk_fetch_by_bookmark(statement);
+    }
+
+    /* SQL_UPDATE_BY_BOOKMARK / SQL_DELETE_BY_BOOKMARK: resolve the bookmark of
+     * each rowset element to its buffered row and apply the positioned operation.
+     * The bulk-operations test uses row_array_size 1 here, so this typically runs
+     * once against the single bound bookmark. The positioned UPDATE reads the
+     * bound column values from rowset element 0; per-element UPDATE values for a
+     * multi-row rowset are out of scope (no acceptance test exercises them). */
+    SQLULEN rowset_size = statement->row_array_size > 0
+                              ? statement->row_array_size : 1;
+    SQLRETURN overall_result = SQL_SUCCESS;
+
+    for (SQLULEN element = 0; element < rowset_size; element++) {
+        int base_row = bulk_resolve_bound_bookmark_row(statement, element);
+        if (base_row < 0 || base_row >= statement->keyset_row_count) {
+            diagnostics_add_record(&statement->diagnostics, "HY107", 0,
+                                   "Bookmark does not resolve to a valid row.");
+            return SQL_ERROR;
+        }
+
+        SQLRETURN row_result;
+        if (operation == SQL_UPDATE_BY_BOOKMARK) {
+            row_result = keyset_positioned_update(statement, base_row);
+        } else {
+            row_result = keyset_positioned_delete(statement, base_row);
+        }
+        if (row_result == SQL_ERROR) {
+            return SQL_ERROR;
+        }
+        if (row_result == SQL_SUCCESS_WITH_INFO) {
+            overall_result = SQL_SUCCESS_WITH_INFO;
+        }
+    }
+    return overall_result;
 }

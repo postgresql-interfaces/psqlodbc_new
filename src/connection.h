@@ -212,6 +212,12 @@ typedef struct OdbcConnection {
  * pgapifunc.h) that MS Access sets to request Jet-compatibility quirks. */
 #define SQL_ATTR_PGOPT_MSJET 65549
 
+/* Driver-specific attribute (psqlodbc pgapifunc.h) that sets the server-side
+ * declare/fetch batch size. This driver buffers every result set client-side,
+ * so the value has no effect, but the attribute must be accepted so applications
+ * that tune fetch size don't fail. */
+#define SQL_ATTR_PGOPT_FETCH 65541
+
 /*
  * Clear all captured notices, freeing the heap-allocated message strings.
  * Called after notices have been promoted to diagnostic records on a statement.

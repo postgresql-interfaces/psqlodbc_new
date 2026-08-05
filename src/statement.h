@@ -21,6 +21,7 @@
 #include "query_parser.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <libpq-fe.h>
 
 /* Forward declaration — full definition is in connection.h */
@@ -75,6 +76,60 @@ typedef struct OdbcDescriptor {
 /* Maximum length for server-side prepared statement names.
  * Names are auto-generated as "_psqlodbc2_stmt_<counter>". */
 #define MAX_PREPARED_NAME_LENGTH 64
+
+/* ---- Keyset (updatable) cursor support ----
+ *
+ * PostgreSQL has no native updatable cursors, so a positioned UPDATE/DELETE is
+ * turned into a searched statement keyed on the row's physical location: its
+ * "ctid" ("(block,offset)"). When the application opens an updatable or
+ * keyset-driven cursor, the driver rewrites the SELECT to also fetch each row's
+ * ctid in a hidden trailing column, so every buffered row carries the key needed
+ * to target it later. See rewrite_select_append_ctid / results_set_pos.
+ *
+ * Sentinel meaning "this statement has no hidden ctid column" (a read-only
+ * cursor, or a query we could not safely rewrite). */
+#define NO_HIDDEN_CTID_COLUMN (-1)
+
+/* Per-row overlay for an updatable cursor. The buffered PGresult is immutable
+ * (libpq owns it), so after a positioned UPDATE/DELETE/REFRESH we cannot mutate
+ * PQgetvalue in place. Instead each row gets one of these overlay entries:
+ *
+ *   - deleted: the row was removed by a positioned DELETE. The fetch engine and
+ *     SQLGetData treat it as if it is not present, and delete bookkeeping skips
+ *     it, so a re-fetch of the still-open cursor never sees it again.
+ *   - override_values: when non-NULL, the row's displayed values come from here
+ *     instead of the base PGresult. Populated from an UPDATE/REFRESH ...
+ *     RETURNING so a re-fetch shows the new committed values (and the new ctid,
+ *     which changes on every UPDATE). The array has one entry per FULL result
+ *     column (including the hidden ctid); a NULL entry means SQL NULL. */
+typedef struct KeysetRow {
+    bool deleted;
+    char **override_values;   /* NULL, or full-width array of heap strings (NULL = SQL NULL) */
+} KeysetRow;
+
+/* Maximum length of a table name captured from an updatable cursor's SELECT, so
+ * SQLSetPos can build "UPDATE <table> ... WHERE ctid=..." against it. */
+#define MAX_KEYSET_TABLE_NAME_LENGTH 256
+
+/* Maximum length of a SQL savepoint name we track for keyset-overlay snapshots. */
+#define MAX_KEYSET_SAVEPOINT_NAME_LENGTH 64
+
+/* Maximum number of named savepoints whose keyset overlay we snapshot at once.
+ * The block-delete regression uses two ("yuuki", "miho"); a small cap suffices. */
+#define MAX_KEYSET_SAVEPOINTS 8
+
+/* A snapshot of an updatable cursor's per-row deleted flags, taken when the
+ * application issues "SAVEPOINT <name>". PostgreSQL has no server-side updatable
+ * cursor here, so a positioned DELETE only marks the client overlay; when the
+ * application later rolls the transaction back to this savepoint (which really
+ * un-deletes the rows on the server), the driver must likewise restore the
+ * overlay's deleted flags — and drop any rows added by SQL_ADD after the
+ * savepoint — so the still-open cursor sees the same rows the server now does. */
+typedef struct KeysetSavepoint {
+    char name[MAX_KEYSET_SAVEPOINT_NAME_LENGTH];
+    bool *deleted_flags;   /* Snapshot of KeysetRow.deleted, one per row */
+    int row_count;         /* Overlay row count at snapshot time (rows added later are dropped on restore) */
+} KeysetSavepoint;
 
 /* Maximum length of an application-supplied cursor name, matching the value
  * reported by SQLGetInfo(SQL_MAX_CURSOR_NAME_LEN). The original psqlodbc caps
@@ -195,7 +250,105 @@ typedef struct OdbcStatement {
      * status (SQL_ROW_SUCCESS / SQL_ROW_NOROW / ...) after each fetch
      * (SQL_ATTR_ROW_STATUS_PTR). NULL when not requested. */
     SQLUSMALLINT *row_status_ptr;
+
+    /* ---- Bookmark support ---- */
+
+    /* SQL_ATTR_USE_BOOKMARKS mode. SQL_UB_OFF (the default) disables bookmarks;
+     * SQL_UB_ON / SQL_UB_VARIABLE enable them. When off, the driver rejects any
+     * attempt to read column 0 (the bookmark column) with SQLSTATE 07009. */
+    SQLULEN use_bookmarks;
+
+    /* SQL_ATTR_FETCH_BOOKMARK_PTR: application pointer to the bookmark value that
+     * SQLFetchScroll(SQL_FETCH_BOOKMARK, offset) positions relative to. The
+     * bookmark stored there is a 4-byte Int4 (see SC_MAKE_INT4_BOOKMARK). */
+    SQLPOINTER fetch_bookmark_ptr;
+
+    /* Column-0 (bookmark) binding. Column 0 never uses the 1-based
+     * column_bindings[] array, so its binding lives here on its own. When
+     * bookmark_bound is true, a single-row fetch writes the current row's
+     * bookmark into bookmark_buffer (and bookmark_indicator, if provided) exactly
+     * as a bound data column would receive its value.
+     *
+     * LIMITATION (Phase 1): bookmark_buffer is a single scalar, not an array
+     * indexed by rowset element, so bound bookmarks are NOT populated on the
+     * block-cursor path (row_array_size > 1). See populate_bound_rowset. */
+    bool bookmark_bound;
+    /* C type the application bound column 0 as: SQL_C_BOOKMARK (fixed 4-byte) or
+     * SQL_C_VARBOOKMARK (variable-length). Selects the buffer-length policy when
+     * writing the bookmark (see write_row_bookmark). */
+    SQLSMALLINT bookmark_target_type;
+    SQLPOINTER bookmark_buffer;          /* Application buffer receiving the bookmark */
+    SQLLEN bookmark_buffer_length;       /* Size of bookmark_buffer in bytes */
+    SQLLEN *bookmark_indicator;          /* Receives sizeof(Int4), or NULL */
+
+    /* ---- Keyset (updatable) cursor support ---- */
+
+    /* True when the application asked for an updatable cursor — either a
+     * keyset-driven cursor type or a writable concurrency (ROWVER/LOCK/VALUES).
+     * When set, an executed simple SELECT is rewritten to capture each row's
+     * hidden ctid so SQLSetPos can build positioned UPDATE/DELETE statements. */
+    bool is_updatable_cursor;
+
+    /* 0-based index of the hidden ctid column appended to the result set, or
+     * NO_HIDDEN_CTID_COLUMN when none was added. The public column count seen by
+     * the application (SQLNumResultCols/SQLDescribeCol/SQLGetData/SQLColAttribute)
+     * excludes this column so the ctid stays invisible. */
+    int hidden_ctid_column_index;
+
+    /* Per-row overlay (deleted flag + updated-value override), allocated to
+     * PQntuples of current_result when an updatable cursor executes. NULL for a
+     * non-updatable cursor. keyset_row_count records the allocation size. */
+    KeysetRow *keyset_rows;
+    int keyset_row_count;
+
+    /* Table name parsed from the updatable cursor's SELECT ("... FROM <table>"),
+     * used to build the positioned UPDATE/DELETE/INSERT. Empty when unknown. */
+    char keyset_table_name[MAX_KEYSET_TABLE_NAME_LENGTH];
+
+    /* First row of the rowset delivered by the most recent block fetch, and how
+     * many rows it contained. SQLSetPos's row_number argument is 1-based WITHIN
+     * this rowset, so it maps to base_row = keyset_rowset_first_row + (n-1).
+     * For a single-row fetch these are current_row_position and 1. */
+    int keyset_rowset_first_row;
+    int keyset_rowset_size;
+
+    /* Keyset-overlay snapshots keyed by savepoint name (see KeysetSavepoint).
+     * Populated when the application issues "SAVEPOINT <name>" on ANY statement
+     * of this connection while an updatable cursor is open, and consulted on
+     * "ROLLBACK TO <name>". Kept on the owning cursor statement. */
+    KeysetSavepoint keyset_savepoints[MAX_KEYSET_SAVEPOINTS];
+    int keyset_savepoint_count;
 } OdbcStatement;
+
+/* ---- Bookmark encoding ----
+ *
+ * A bookmark is a 4-byte signed integer: a 1-based row index derived from the
+ * 0-based client-side cursor position. Matching the original driver
+ * (statement.h: BOOKMARK_SHIFT), a non-negative row R is stored as R + 1 so the
+ * value is never zero (zero is reserved to mean "no bookmark"); negative
+ * sentinels pass through unchanged. SQLFetchScroll(SQL_FETCH_BOOKMARK) reverses
+ * the shift to recover the base 0-based row. */
+#define BOOKMARK_ROW_INDEX_SHIFT 1
+
+/* 4-byte signed bookmark value, matching the original driver's Int4 bookmark. */
+typedef int32_t Int4Bookmark;
+
+/* Encode a 0-based cursor row as its on-the-wire bookmark (row + 1 for real
+ * rows; negative sentinels unchanged). */
+static inline Int4Bookmark statement_make_int4_bookmark(int zero_based_row)
+{
+    return (zero_based_row < 0)
+               ? (Int4Bookmark)zero_based_row
+               : (Int4Bookmark)(zero_based_row + BOOKMARK_ROW_INDEX_SHIFT);
+}
+
+/* Decode an on-the-wire bookmark back to its 0-based cursor row. */
+static inline int statement_resolve_int4_bookmark(Int4Bookmark bookmark)
+{
+    return (bookmark < 0)
+               ? (int)bookmark
+               : (int)(bookmark - BOOKMARK_ROW_INDEX_SHIFT);
+}
 
 /* ---- Public Interface ---- */
 
@@ -275,5 +428,52 @@ SQLRETURN statement_promote_next_result(OdbcStatement *statement);
  * Returns SQL_SUCCESS on success, SQL_ERROR on invalid option.
  */
 SQLRETURN statement_free_stmt(OdbcStatement *statement, SQLUSMALLINT option);
+
+/* ---- Keyset (updatable) cursor helpers ---- */
+
+/*
+ * Number of columns visible to the application. This is PQnfields of the current
+ * result minus the hidden ctid column (if the cursor is updatable), so the ctid
+ * we appended to the SELECT never appears in SQLNumResultCols / SQLDescribeCol /
+ * SQLColAttribute / SQLGetData. Returns 0 when there is no result.
+ */
+int statement_public_column_count(const OdbcStatement *statement);
+
+/*
+ * Read a value for the current result set through the keyset overlay: if the row
+ * has an updated-value override (from a positioned UPDATE/REFRESH), return that;
+ * otherwise return the base PGresult value. Sets *is_null. Used by the fetch and
+ * SQLGetData paths so an updated row shows its new value on re-fetch.
+ */
+const char *statement_row_value(const OdbcStatement *statement,
+                                int row_index, int column_index, bool *is_null);
+
+/*
+ * Return true if the given 0-based base row was deleted via a positioned DELETE
+ * and must be skipped by fetching and bookkeeping. Always false for a
+ * non-updatable cursor.
+ */
+bool statement_row_is_deleted(const OdbcStatement *statement, int row_index);
+
+/*
+ * Perform an ODBC SQLSetPos operation (SQL_UPDATE / SQL_DELETE / SQL_REFRESH /
+ * SQL_ADD / SQL_POSITION) on the current updatable cursor. Implemented in
+ * results.c but declared here so the SQLSetPos entry point can delegate.
+ */
+SQLRETURN statement_set_pos(OdbcStatement *statement,
+                            SQLSETPOSIROW row_number,
+                            SQLUSMALLINT operation,
+                            SQLUSMALLINT lock_type);
+
+/*
+ * Perform an ODBC SQLBulkOperations request (SQL_ADD, SQL_UPDATE_BY_BOOKMARK,
+ * SQL_DELETE_BY_BOOKMARK, or SQL_FETCH_BY_BOOKMARK) on the current updatable
+ * cursor. Unlike SQLSetPos, the bookmark-based operations identify their target
+ * row(s) by the bookmark(s) held in the bound column-0 buffer rather than by a
+ * rowset row number. Implemented in results.c; declared here so the
+ * SQLBulkOperations entry point can delegate.
+ */
+SQLRETURN statement_bulk_operations(OdbcStatement *statement,
+                                    SQLUSMALLINT operation);
 
 #endif /* PSQLODBC2_STATEMENT_H */
