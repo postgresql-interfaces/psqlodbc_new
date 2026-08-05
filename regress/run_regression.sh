@@ -129,10 +129,24 @@ cc $CFLAGS -c "$ORIG_TEST_DIR/src/common.c" -o "$WORK_DIR/exe/common.o" 2>/dev/n
     cc $CFLAGS -I"$WORK_DIR" -c "$ORIG_TEST_DIR/src/common.c" -o "$WORK_DIR/exe/common.o"
 }
 
-# Load sample tables
+# Reset the database to the pristine sample-table state.
+#
+# This is called before EVERY test, not just once at the start, to give each
+# test complete isolation. Tests share table names (e.g. testtab1) and some
+# commit changes or leave a transaction mid-flight when they crash; without a
+# per-test reset, one test's residue can perturb a later test's assertions,
+# producing order-dependent flakiness (observed with fetch-refcursors, which
+# reads and asserts exact rows of testtab1). Dropping and recreating the schema
+# guarantees a deterministic starting point regardless of run order.
+load_sample_tables() {
+    psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q \
+        -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" 2>/dev/null || true
+    psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q \
+        -f "$ORIG_TEST_DIR/sampletables.sql" 2>/dev/null
+}
+
 echo "Loading sample tables..."
-psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" 2>/dev/null || true
-psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q -f "$ORIG_TEST_DIR/sampletables.sql" 2>/dev/null
+load_sample_tables
 
 # Determine which tests to run.
 #
@@ -187,6 +201,10 @@ for test_name in $TESTS; do
         SKIP=$((SKIP + 1))
         continue
     fi
+
+    # Reset to pristine sample-table state so this test is isolated from any
+    # residue left by earlier tests (see load_sample_tables above).
+    load_sample_tables
 
     # Run the test and capture output
     result_file="$WORK_DIR/results/${test_name}.out"
