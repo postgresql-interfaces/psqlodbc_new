@@ -10,6 +10,7 @@ driver_sources = files(
     'parameter.c',
     'column_binding.c',
     'type_mapping.c',
+    'large_object.c',
     'results.c',
     'catalog.c',
     'error_mapping.c',

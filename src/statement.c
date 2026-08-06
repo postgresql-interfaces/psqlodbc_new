@@ -17,6 +17,7 @@
 #include "query_parser.h"
 #include "type_mapping.h"
 #include "results.h"
+#include "large_object.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -254,6 +255,14 @@ static void clear_current_result(OdbcStatement *statement)
 {
     clear_keyset_overlay(statement);
 
+    /* Abandon any half-finished data-at-execution protocol. A new execution (or
+     * a cursor close) invalidates the accumulated chunks; freeing them here
+     * keeps a re-used statement handle from leaking stale buffers. */
+    statement_reset_data_at_exec(statement);
+
+    /* Likewise close any large-object read left open on the previous result. */
+    statement_reset_large_object_read(statement);
+
     if (statement->current_result) {
         PQclear(statement->current_result);
         statement->current_result = NULL;
@@ -478,6 +487,22 @@ SQLRETURN statement_allocate(OdbcConnection *connection, SQLHANDLE *output_handl
     statement->affected_row_count = -1;
     statement->current_row_position = -1;
 
+    /* No large-object read is in progress on a fresh handle. calloc zeroed the
+     * struct, but -1 (not 0) is the "no descriptor / no column" sentinel. */
+    statement->large_object_read_fd = -1;
+    statement->large_object_read_column = -1;
+    statement->large_object_read_row = -1;
+    statement->large_object_read_bytes_remaining = -1;
+
+    /* Each data-at-execution parameter slot's large-object write descriptor
+     * starts closed. calloc zeroed these to 0, but 0 is a plausible descriptor
+     * value; the reset path's close guard treats any fd >= 0 as open, so the -1
+     * "no descriptor" sentinel must be set explicitly to keep the first reset
+     * from closing fd 0 (which would abort an autocommit-OFF transaction). */
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        statement->data_at_exec.parameters[index].large_object_fd = -1;
+    }
+
     /* Register the four implicit descriptors (ARD/APD/IRD/IPD) embedded in the
      * statement. Each routes field access to this statement's backing stores
      * (column_bindings / parameter_bindings / result metadata). The active
@@ -611,6 +636,232 @@ SQLRETURN statement_free(SQLHANDLE handle)
     free(statement);
 
     return SQL_SUCCESS;
+}
+
+/*
+ * Record the server-inferred parameter type OIDs from a PQdescribePrepared
+ * result so they remain available at execute time (the describe result itself
+ * is cleared before parameters are converted). Used to recognize large-object
+ * ("lo") parameters, whose value must be sent as a large object's Oid rather
+ * than as bytea. Positions beyond MAX_PARAMETERS are ignored.
+ */
+static void statement_capture_parameter_types(OdbcStatement *statement,
+                                              PGresult *describe_result)
+{
+    int param_count = PQnparams(describe_result);
+    if (param_count > MAX_PARAMETERS) {
+        param_count = MAX_PARAMETERS;
+    }
+    for (int index = 0; index < param_count; index++) {
+        statement->parameter_type_oids[index] = PQparamtype(describe_result, index);
+    }
+    statement->parameter_type_oid_count = param_count;
+}
+
+/*
+ * Return true if parameter marker (0-based) index targets a large-object ("lo")
+ * column, i.e. its server-inferred type is the connection's detected large
+ * object domain. Such a parameter's value must be stored as a large object and
+ * sent as that object's Oid, not as inline bytea. Returns false when the type
+ * was not captured (e.g. direct execution) or the connection has no "lo" domain.
+ */
+static bool statement_parameter_is_large_object(const OdbcStatement *statement,
+                                               int index)
+{
+    if (index < 0 || index >= statement->parameter_type_oid_count) {
+        return false;
+    }
+    return connection_type_is_large_object(statement->parent_connection,
+                                           statement->parameter_type_oids[index]);
+}
+
+/*
+ * Create a large object from an in-memory buffer and return its Oid as decimal
+ * text (caller frees), or NULL on failure with a diagnostic recorded.
+ *
+ * This is the "inline" large-object parameter path: the whole value is already
+ * in memory (bound via SQLBindParameter with a real buffer, not SQL_DATA_AT_EXEC),
+ * so we create the object, open it for writing, write the entire buffer, and
+ * close it in one shot — mirroring the original driver's in-line convert path.
+ * The returned text is what gets sent for the parameter marker; PostgreSQL
+ * stores it into the "lo" column as the object's Oid.
+ */
+static char *statement_store_inline_large_object(OdbcStatement *statement,
+                                                const unsigned char *data,
+                                                size_t data_length)
+{
+    OdbcConnection *connection = statement->parent_connection;
+    PGconn *libpq_connection = connection->libpq_connection;
+
+    /* Large object descriptors are only valid inside a transaction. */
+    if (large_object_ensure_transaction(connection) != SQL_SUCCESS) {
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Could not begin a transaction for the large object.");
+        return NULL;
+    }
+
+    Oid object_id = large_object_create(libpq_connection);
+    if (object_id == InvalidOid) {
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Could not create the large object.");
+        return NULL;
+    }
+
+    int descriptor = large_object_open(libpq_connection, object_id,
+                                       LARGE_OBJECT_MODE_WRITE);
+    if (descriptor < 0) {
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Could not open the large object for writing.");
+        return NULL;
+    }
+
+    if (data_length > 0 &&
+        large_object_write(libpq_connection, descriptor,
+                           (const char *)data, data_length) < 0) {
+        large_object_close(libpq_connection, descriptor);
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Could not write to the large object.");
+        return NULL;
+    }
+
+    large_object_close(libpq_connection, descriptor);
+
+    /* An Oid is a 32-bit unsigned value: at most 10 decimal digits plus NUL. */
+    char *oid_text = malloc(16);
+    if (!oid_text) {
+        diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                               "Out of memory formatting the large object Oid.");
+        return NULL;
+    }
+    snprintf(oid_text, 16, "%u", (unsigned int)object_id);
+    return oid_text;
+}
+
+/*
+ * After the ordinary parameter arrays are built for a prepared execution,
+ * replace every inline large-object parameter's slot with the Oid of a newly
+ * stored large object. The generic converter hex-encodes an SQL_C_BINARY value
+ * as bytea, which is wrong for a "lo" column; here we instead create the object
+ * from the bound buffer and substitute its Oid text.
+ *
+ * Only parameters bound with a real buffer are handled — data-at-execution
+ * large objects are streamed and substituted separately (see the data-at-exec
+ * path). row_index selects the parameter set for array binding (0 for a single
+ * set). Returns SQL_SUCCESS, or SQL_ERROR if storing an object failed.
+ *
+ * On a mid-substitution failure — where an earlier parameter already created an
+ * object under an implicitly-opened autocommit transaction — the implicit
+ * transaction is rolled back before returning so it is not left open (and the
+ * orphaned object discarded). A transaction the application owns (autocommit
+ * OFF) is never touched; the caller decides how to recover.
+ */
+static void statement_rollback_large_object_transaction(OdbcStatement *statement);
+
+static SQLRETURN statement_substitute_inline_large_objects(OdbcStatement *statement,
+                                                          const char **values,
+                                                          int *lengths,
+                                                          int *formats,
+                                                          int param_count,
+                                                          SQLULEN row_index)
+{
+    for (int index = 0; index < param_count && index < MAX_PARAMETERS; index++) {
+        if (!statement_parameter_is_large_object(statement, index)) {
+            continue;
+        }
+        const ParameterBinding *binding = &statement->parameter_bindings[index];
+        if (!binding->is_bound || !binding->value_buffer) {
+            continue;   /* Unbound or NULL → leave the converter's NULL/value. */
+        }
+
+        /* Resolve this set's raw bytes and length. Binary parameters use the
+         * explicit buffer_length as the per-set stride; the indicator array (one
+         * SQLLEN per set) carries the byte count. */
+        size_t stride = binding->buffer_length > 0 ? (size_t)binding->buffer_length : 0;
+        const unsigned char *data =
+            (const unsigned char *)binding->value_buffer + row_index * stride;
+
+        SQLLEN declared_length = binding->indicator_or_length
+                                     ? binding->indicator_or_length[row_index]
+                                     : (SQLLEN)binding->buffer_length;
+        if (declared_length == SQL_NULL_DATA) {
+            continue;   /* NULL large object: leave the slot as SQL NULL. */
+        }
+        size_t data_length = declared_length >= 0 ? (size_t)declared_length : 0;
+
+        char *oid_text = statement_store_inline_large_object(statement, data, data_length);
+        if (!oid_text) {
+            /* A previous parameter may have created an object under a
+             * transaction this call opened implicitly (autocommit ON). Discard
+             * it so the connection is not left with an open transaction and an
+             * orphaned large object. No-op under autocommit OFF (app-owned tx). */
+            statement_rollback_large_object_transaction(statement);
+            return SQL_ERROR;
+        }
+
+        /* Replace the hex-encoded bytea the converter produced with the Oid. */
+        free((void *)values[index]);
+        values[index] = oid_text;
+        lengths[index] = (int)strlen(oid_text);
+        formats[index] = 0;
+    }
+    return SQL_SUCCESS;
+}
+
+/*
+ * True if any bound parameter marker of this statement targets a large object.
+ * Cheap guard so the ordinary execute path pays nothing when no "lo" parameter
+ * is involved (the common case).
+ */
+static bool statement_has_large_object_parameter(const OdbcStatement *statement)
+{
+    if (statement->parent_connection->large_object_type_oid == InvalidOid) {
+        return false;
+    }
+    int count = statement->parameter_type_oid_count;
+    if (count > statement->detected_param_count) {
+        count = statement->detected_param_count;
+    }
+    for (int index = 0; index < count; index++) {
+        if (statement_parameter_is_large_object(statement, index)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Commit a transaction that was opened solely to write a large object on an
+ * autocommit-ON connection, so the object and the statement that references it
+ * are persisted together. On an autocommit-OFF connection the application owns
+ * the transaction, so this is a no-op. A commit failure is surfaced as a
+ * diagnostic but does not change the already-obtained execution result.
+ */
+static void statement_commit_large_object_transaction(OdbcStatement *statement)
+{
+    OdbcConnection *connection = statement->parent_connection;
+    if (connection->autocommit &&
+        connection->transaction_state == TRANSACTION_STATE_ACTIVE) {
+        connection_commit(connection);
+    }
+}
+
+/*
+ * Roll back the transaction that large-object streaming opened implicitly on an
+ * autocommit-ON connection when the referencing statement then failed. Without
+ * this, the transaction (opened by large_object_ensure_transaction) is left
+ * ACTIVE or, once the failing execute marked it, FAILED — so every later
+ * statement on the connection gets "current transaction is aborted". Rolling it
+ * back here restores the clean per-statement autocommit contract. On an
+ * autocommit-OFF connection the application owns the transaction, so this is a
+ * no-op (the app decides whether to roll back).
+ */
+static void statement_rollback_large_object_transaction(OdbcStatement *statement)
+{
+    OdbcConnection *connection = statement->parent_connection;
+    if (connection->autocommit &&
+        connection->transaction_state != TRANSACTION_STATE_IDLE) {
+        connection_rollback(connection);
+    }
 }
 
 /*
@@ -826,6 +1077,10 @@ SQLRETURN statement_prepare(OdbcStatement *statement,
                                                     statement->prepared_name);
     if (describe_result && PQresultStatus(describe_result) == PGRES_COMMAND_OK) {
         statement->describe_result = describe_result;
+        /* Capture the server-inferred parameter type OIDs now: the describe
+         * result is cleared before parameters are converted at execute time, but
+         * the execute path needs these to spot large-object ("lo") parameters. */
+        statement_capture_parameter_types(statement, describe_result);
     } else {
         /* If describe fails, we still consider the prepare successful —
          * metadata just won't be available until after execution. */
@@ -1244,6 +1499,17 @@ SQLRETURN statement_execute(OdbcStatement *statement)
         return execute_multi_statement(statement);
     }
 
+    /* Data-at-execution: if any bound parameter of the first set was flagged
+     * SQL_DATA_AT_EXEC, defer execution and return SQL_NEED_DATA. The
+     * application then streams the values via SQLParamData / SQLPutData, and the
+     * final SQLParamData actually runs the statement. */
+    if (statement->bound_parameter_count > 0 &&
+        statement->detected_param_count > 0 &&
+        statement_row_has_data_at_exec(statement, 0)) {
+        statement_begin_data_at_exec(statement, true /* use prepared */, 0);
+        return SQL_NEED_DATA;
+    }
+
     /* Array/batch parameter binding: when the application bound arrays of
      * parameter values (SQL_ATTR_PARAMSET_SIZE > 1), execute once per set. The
      * single-set path below is left exactly as it was for paramset_size <= 1. */
@@ -1284,6 +1550,21 @@ SQLRETURN statement_execute(OdbcStatement *statement)
             effective_param_count = statement->detected_param_count;
         }
 
+        /* Inline large-object parameters: replace each "lo"-typed parameter's
+         * hex-encoded bytea with the Oid of a freshly stored large object. */
+        bool stored_large_object = false;
+        if (statement_has_large_object_parameter(statement)) {
+            if (statement_substitute_inline_large_objects(
+                    statement, param_values, param_lengths, param_formats,
+                    effective_param_count, 0) != SQL_SUCCESS) {
+                parameter_free_libpq_arrays(param_values, param_lengths,
+                                            param_formats, param_count);
+                connection_handle_statement_error(statement->parent_connection);
+                return SQL_ERROR;
+            }
+            stored_large_object = true;
+        }
+
         result = PQexecPrepared(libpq_connection,
                                 statement->prepared_name,
                                 effective_param_count,
@@ -1293,6 +1574,12 @@ SQLRETURN statement_execute(OdbcStatement *statement)
                                 0  /* result format: text */);
 
         parameter_free_libpq_arrays(param_values, param_lengths, param_formats, param_count);
+
+        /* Persist the large object and its referencing row together when the
+         * driver opened the transaction implicitly (autocommit ON). */
+        if (stored_large_object) {
+            statement_commit_large_object_transaction(statement);
+        }
     } else {
         /* No parameters bound or no parameter markers — execute without parameters */
         result = PQexecPrepared(libpq_connection,
@@ -1436,6 +1723,15 @@ static SQLRETURN statement_execute_parameter_array(OdbcStatement *statement,
     bool any_notice_overall = false;
     bool execution_failed = false;
 
+    /* Set once any row stored a large object, so the implicit transaction opened
+     * under autocommit (large_object_ensure_transaction) is committed on success
+     * or rolled back on failure — mirroring the single-set inline path. */
+    bool stored_large_object = false;
+
+    /* Whether any bound parameter targets a "lo" column; hoisted out of the row
+     * loop since it depends only on the (fixed) parameter type descriptors. */
+    bool has_large_object_parameter = statement_has_large_object_parameter(statement);
+
     for (SQLULEN batch_start = 0; batch_start < row_count && !execution_failed;
          batch_start += (SQLULEN)batch_size) {
         SQLULEN batch_end = batch_start + (SQLULEN)batch_size;  /* exclusive */
@@ -1480,6 +1776,22 @@ static SQLRETURN statement_execute_parameter_array(OdbcStatement *statement,
             int effective_param_count = param_count;
             if (effective_param_count > statement->detected_param_count) {
                 effective_param_count = statement->detected_param_count;
+            }
+
+            /* Inline large-object parameters: for a "lo"-typed parameter the
+             * generic converter produced hex bytea, which a "lo" column would
+             * reject as a type mismatch. Replace this row's slot with the Oid of
+             * a freshly stored large object, exactly as the single-set path does. */
+            if (has_large_object_parameter) {
+                if (statement_substitute_inline_large_objects(
+                        statement, param_values, param_lengths, param_formats,
+                        effective_param_count, row) != SQL_SUCCESS) {
+                    parameter_free_libpq_arrays(param_values, param_lengths,
+                                                param_formats, param_count);
+                    batch_had_error = true;
+                    break;
+                }
+                stored_large_object = true;
             }
 
             PGresult *result;
@@ -1587,7 +1899,21 @@ static SQLRETURN statement_execute_parameter_array(OdbcStatement *statement,
         statement->has_result_set = false;
         statement->affected_row_count = -1;
         statement->state = STATEMENT_STATE_EXECUTED;
+        /* Discard the implicit large-object transaction (if any) so an autocommit
+         * connection is left clean rather than in an aborted state. (The existing
+         * non-LO array path intentionally leaves transaction recovery to the
+         * caller, so nothing else is changed here.) */
+        if (stored_large_object) {
+            statement_rollback_large_object_transaction(statement);
+        }
         return SQL_ERROR;
+    }
+
+    /* All batches succeeded: persist any streamed/inline large objects together
+     * with their referencing rows by committing the implicit transaction opened
+     * under autocommit (no-op when nothing was stored). */
+    if (stored_large_object) {
+        statement_commit_large_object_transaction(statement);
     }
 
     if (chained_count > 0) {
@@ -2754,6 +3080,15 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
         return multi_result;
     }
 
+    /* Data-at-execution: defer and return SQL_NEED_DATA if any parameter of the
+     * first set was bound with SQL_DATA_AT_EXEC (see statement_execute). */
+    if (statement->bound_parameter_count > 0 &&
+        statement->detected_param_count > 0 &&
+        statement_row_has_data_at_exec(statement, 0)) {
+        statement_begin_data_at_exec(statement, false /* direct SQL */, 0);
+        return SQL_NEED_DATA;
+    }
+
     /* Array/batch parameter binding for direct execution: run once per bound
      * parameter set (see statement_execute_parameter_array). The single-set path
      * below is unchanged for paramset_size <= 1. */
@@ -2839,6 +3174,792 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
         return handle_call_result(statement, execution_result);
     }
     return execution_result;
+}
+
+/* ---- Data-at-execution (SQL_DATA_AT_EXEC) implementation ---- */
+
+bool statement_length_is_data_at_exec(SQLLEN length_or_indicator)
+{
+    /* SQL_DATA_AT_EXEC is the simple marker; SQL_LEN_DATA_AT_EXEC(length)
+     * encodes a length hint as any value at or below the offset sentinel. Both
+     * mean "the value is supplied later via SQLPutData". */
+    return length_or_indicator == SQL_DATA_AT_EXEC ||
+           length_or_indicator <= SQL_LEN_DATA_AT_EXEC_OFFSET;
+}
+
+/*
+ * Read parameter N's length/indicator for parameter set (row) row_index. With
+ * column-wise array binding the indicator pointer is the base of an array of
+ * SQLLEN, one per set; a single-set binding uses element 0. Returns 0 when the
+ * parameter has no indicator pointer (then it cannot be a data-at-exec param).
+ */
+static SQLLEN data_at_exec_indicator_for_row(const ParameterBinding *binding,
+                                             SQLULEN row_index)
+{
+    if (!binding->indicator_or_length) {
+        return 0;
+    }
+    return binding->indicator_or_length[row_index];
+}
+
+bool statement_row_has_data_at_exec(const OdbcStatement *statement, SQLULEN row_index)
+{
+    /* Cap at detected_param_count: only the markers the current SQL references
+     * matter, and a stale wider binding's single-element indicator must not be
+     * indexed at row_index > 0 (out-of-bounds read). See
+     * data_at_exec_mark_needs_data for the full rationale. */
+    for (int index = 0;
+         index < statement->detected_param_count && index < MAX_PARAMETERS; index++) {
+        const ParameterBinding *binding = &statement->parameter_bindings[index];
+        if (!binding->is_bound || !binding->indicator_or_length) {
+            continue;
+        }
+        if (statement_length_is_data_at_exec(
+                data_at_exec_indicator_for_row(binding, row_index))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void statement_reset_data_at_exec(OdbcStatement *statement)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        free(state->parameters[index].buffer);
+        /* Close any large-object write descriptor left open by an aborted
+         * streaming sequence so it does not linger for the transaction's life. */
+        if (state->parameters[index].large_object_fd >= 0 &&
+            statement->parent_connection &&
+            statement->parent_connection->libpq_connection) {
+            large_object_close(statement->parent_connection->libpq_connection,
+                               state->parameters[index].large_object_fd);
+        }
+    }
+    /* Discard any result sets collected during a partially-completed array
+     * data-at-exec run that never got published to pending_results. */
+    if (state->chained_results) {
+        for (int index = 0; index < state->chained_count; index++) {
+            if (state->chained_results[index]) {
+                PQclear(state->chained_results[index]);
+            }
+        }
+        free(state->chained_results);
+    }
+
+    memset(state, 0, sizeof(*state));
+    state->current_parameter_index = DATA_AT_EXEC_NO_CURRENT_PARAMETER;
+
+    /* memset zeroed every large_object_fd, but 0 is a plausible descriptor value
+     * and the close guard above treats any fd >= 0 as open. Restore the -1 "no
+     * descriptor" sentinel so a subsequent reset does not try to close fd 0 —
+     * doing so inside an autocommit-OFF transaction would abort that transaction.
+     */
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        state->parameters[index].large_object_fd = -1;
+    }
+}
+
+/*
+ * Flag each parameter of the given set (row) that was bound with a
+ * data-at-execution indicator as needing streamed data.
+ *
+ * The scan is capped at detected_param_count — the number of markers the
+ * current SQL actually references — for the same reason data_at_exec_build_arrays
+ * is: a stale wider binding left over from a previous statement (the application
+ * did not SQL_RESET_PARAMS) may have a single-element indicator, so reading
+ * indicator[row_index] for row_index > 0 under paramset binding would be an
+ * out-of-bounds read, and would also hand out a bogus extra token.
+ */
+static void data_at_exec_mark_needs_data(OdbcStatement *statement, SQLULEN row_index)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+    for (int index = 0;
+         index < statement->detected_param_count && index < MAX_PARAMETERS; index++) {
+        const ParameterBinding *binding = &statement->parameter_bindings[index];
+        if (binding->is_bound && binding->indicator_or_length &&
+            statement_length_is_data_at_exec(
+                data_at_exec_indicator_for_row(binding, row_index))) {
+            state->parameters[index].needs_data = true;
+            /* A deferred parameter targeting a "lo" column streams its chunks
+             * straight into a large object rather than accumulating them in
+             * memory. Its descriptor is opened lazily on the first SQLPutData. */
+            state->parameters[index].is_large_object =
+                statement_parameter_is_large_object(statement, index);
+            state->parameters[index].large_object_oid = InvalidOid;
+            state->parameters[index].large_object_fd = -1;
+        }
+    }
+}
+
+void statement_begin_data_at_exec(OdbcStatement *statement, bool use_prepared,
+                                  SQLULEN row_index)
+{
+    statement_reset_data_at_exec(statement);
+
+    DataAtExecState *state = &statement->data_at_exec;
+    state->in_need_data = true;
+    state->use_prepared = use_prepared;
+    state->current_parameter_index = DATA_AT_EXEC_NO_CURRENT_PARAMETER;
+    state->current_row = row_index;
+    state->row_count = statement->paramset_size > 0 ? statement->paramset_size : 1;
+
+    /* Mark which parameters of this set were bound with a deferred indicator. */
+    data_at_exec_mark_needs_data(statement, row_index);
+
+    /* For array (paramset) binding, prepare to collect one result set per
+     * executed set (only tuple-bearing ones are retained) and start every set's
+     * status as UNUSED, exactly like statement_execute_parameter_array. */
+    if (state->row_count > 1) {
+        state->chained_results = calloc((size_t)state->row_count, sizeof(PGresult *));
+        state->chained_count = 0;
+        if (statement->param_status_ptr) {
+            for (SQLULEN row = 0; row < state->row_count; row++) {
+                statement->param_status_ptr[row] = SQL_PARAM_UNUSED;
+            }
+        }
+        /* params_processed reflects the 1-based set currently being filled, set
+         * before SQLParamData hands out that set's first token — matching the
+         * original driver, which increments it as each set begins. The test
+         * reads it to decide which chunk to stream for the current set. */
+        if (statement->params_processed_ptr) {
+            *statement->params_processed_ptr = row_index + 1;
+        }
+    }
+}
+
+/*
+ * Reset only the per-parameter accumulation (not the whole state) so the next
+ * parameter set of an array data-at-exec execution starts with empty buffers
+ * while preserving the collected result-set chain.
+ */
+static void data_at_exec_rearm_for_row(OdbcStatement *statement, SQLULEN row_index)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        free(state->parameters[index].buffer);
+        state->parameters[index].buffer = NULL;
+        state->parameters[index].length = 0;
+        state->parameters[index].capacity = 0;
+        state->parameters[index].data_started = false;
+        state->parameters[index].is_null = false;
+        state->parameters[index].needs_data = false;
+        state->parameters[index].is_large_object = false;
+        state->parameters[index].large_object_oid = InvalidOid;
+        state->parameters[index].large_object_fd = -1;
+    }
+    state->current_parameter_index = DATA_AT_EXEC_NO_CURRENT_PARAMETER;
+    state->current_row = row_index;
+
+    data_at_exec_mark_needs_data(statement, row_index);
+}
+
+/*
+ * Build the libpq parameter arrays for the current data-at-execution parameter
+ * set, substituting each deferred parameter's accumulated bytes (as a
+ * PostgreSQL bytea hex literal) for its value. Non-deferred parameters are
+ * converted from their bound application buffers exactly as a normal execution
+ * would (using the array-row builder so paramset binding reads the right
+ * element).
+ *
+ * Caller frees the arrays with parameter_free_libpq_arrays. Returns SQL_SUCCESS
+ * or SQL_ERROR on allocation failure.
+ */
+static SQLRETURN data_at_exec_build_arrays(OdbcStatement *statement,
+                                           const char ***out_values,
+                                           int **out_lengths,
+                                           int **out_formats,
+                                           int *out_count)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+
+    /* Build from a local copy of the bindings with two classes of parameter
+     * neutralized (marked unbound so the generic converter emits SQL NULL and
+     * never dereferences them):
+     *   - Deferred (data-at-exec) parameters: their value pointer is an
+     *     application token, not real data, and their indicator is a
+     *     SQL_DATA_AT_EXEC sentinel. We overwrite their slots with the streamed
+     *     bytes below.
+     *   - Parameters beyond what the current SQL references: an application may
+     *     reuse the handle without SQL_RESET_PARAMS, leaving a stale wider
+     *     binding whose single-element indicator would be read out of bounds by
+     *     the array-row builder (paramset_size > 1). */
+    ParameterBinding local_bindings[MAX_PARAMETERS];
+    memcpy(local_bindings, statement->parameter_bindings, sizeof(local_bindings));
+    for (int index = 0; index < MAX_PARAMETERS; index++) {
+        if (index >= statement->detected_param_count) {
+            /* Stale binding the current SQL does not use — fully unbind it. */
+            local_bindings[index].is_bound = false;
+        } else if (state->parameters[index].needs_data) {
+            /* Deferred parameter: keep it "bound" so the array builder still
+             * counts it, but sever the token/sentinel pointers so the generic
+             * converter emits SQL NULL instead of dereferencing them. The real
+             * streamed value is written into this slot by the loop below. */
+            local_bindings[index].value_buffer = NULL;
+            local_bindings[index].indicator_or_length = NULL;
+        }
+    }
+
+    /* Start from the ordinary per-row conversion so non-deferred parameters and
+     * unbound gaps are handled identically to a normal array execution. */
+    SQLRETURN build_result = parameter_build_libpq_arrays_for_row(
+        local_bindings, state->current_row,
+        out_values, out_lengths, out_formats, out_count);
+    if (build_result != SQL_SUCCESS) {
+        return SQL_ERROR;
+    }
+
+    /* Overwrite each deferred parameter's slot with the streamed bytes. The
+     * accumulated data is raw binary, so send it as a bytea hex literal
+     * ("\x...."), matching how SQL_C_BINARY parameters are encoded elsewhere. */
+    const char **values = *out_values;
+    int *lengths = *out_lengths;
+    int parameter_count = *out_count;
+
+    for (int index = 0; index < parameter_count && index < MAX_PARAMETERS; index++) {
+        DataAtExecParameter *deferred = &state->parameters[index];
+        if (!deferred->needs_data) {
+            continue;
+        }
+
+        /* Replace whatever the row builder produced for this slot. Null the
+         * pointer immediately so that if a later malloc fails and we bail to
+         * parameter_free_libpq_arrays, this already-freed slot is not freed
+         * again (double-free). */
+        free((void *)values[index]);
+        values[index] = NULL;
+
+        /* Large-object parameter: its bytes were already streamed into a large
+         * object by SQLPutData. Close the write descriptor and send the object's
+         * Oid (decimal text) as the parameter value — the "lo" column stores
+         * that Oid, not the bytes themselves. */
+        if (deferred->is_large_object && !deferred->is_null &&
+            deferred->large_object_oid != InvalidOid) {
+            if (deferred->large_object_fd >= 0) {
+                large_object_close(statement->parent_connection->libpq_connection,
+                                   deferred->large_object_fd);
+                deferred->large_object_fd = -1;
+            }
+            char *oid_text = malloc(16);
+            if (!oid_text) {
+                parameter_free_libpq_arrays(values, lengths, *out_formats, parameter_count);
+                *out_values = NULL;
+                *out_lengths = NULL;
+                *out_formats = NULL;
+                *out_count = 0;
+                return SQL_ERROR;
+            }
+            snprintf(oid_text, 16, "%u", (unsigned int)deferred->large_object_oid);
+            values[index] = oid_text;
+            lengths[index] = (int)strlen(oid_text);
+            continue;
+        }
+
+        if (deferred->is_null || deferred->buffer == NULL) {
+            values[index] = NULL;   /* SQL NULL */
+            lengths[index] = 0;
+            continue;
+        }
+
+        size_t data_length = (size_t)deferred->length;
+        size_t hex_length = 2 + (data_length * 2);   /* "\x" + two hex chars per byte */
+        char *encoded = malloc(hex_length + 1);
+        if (!encoded) {
+            parameter_free_libpq_arrays(values, lengths, *out_formats, parameter_count);
+            *out_values = NULL;
+            *out_lengths = NULL;
+            *out_formats = NULL;
+            *out_count = 0;
+            return SQL_ERROR;
+        }
+        encoded[0] = '\\';
+        encoded[1] = 'x';
+        const unsigned char *bytes = (const unsigned char *)deferred->buffer;
+        for (size_t byte_index = 0; byte_index < data_length; byte_index++) {
+            snprintf(encoded + 2 + (byte_index * 2), 3, "%02x", bytes[byte_index]);
+        }
+        encoded[hex_length] = '\0';
+        values[index] = encoded;
+        lengths[index] = (int)hex_length;
+    }
+
+    return SQL_SUCCESS;
+}
+
+/*
+ * Run the query once with the data-at-execution parameter set that has just
+ * been fully supplied. Executes via PQexecPrepared or PQexecParams depending on
+ * how the protocol was started (SQLExecute vs SQLExecDirect).
+ *
+ * For a single parameter set this behaves like the ordinary single-set path:
+ * the result is handed to handle_execution_result and becomes current. For
+ * paramset binding it collects each tuple-bearing result into the chain and
+ * advances current_row; when the last set completes it publishes the chain for
+ * SQLMoreResults. Returns the SQLRETURN to propagate from SQLParamData.
+ */
+static SQLRETURN data_at_exec_execute_current_row(OdbcStatement *statement)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+    PGconn *libpq_connection = statement->parent_connection->libpq_connection;
+
+    const char **param_values = NULL;
+    int *param_lengths = NULL;
+    int *param_formats = NULL;
+    int param_count = 0;
+
+    if (data_at_exec_build_arrays(statement, &param_values, &param_lengths,
+                                  &param_formats, &param_count) != SQL_SUCCESS) {
+        diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                               "Failed to build parameter arrays for data-at-execution.");
+        statement_reset_data_at_exec(statement);
+        return SQL_ERROR;
+    }
+
+    /* Never forward more parameters than the SQL actually references. */
+    int effective_param_count = param_count;
+    if (effective_param_count > statement->detected_param_count) {
+        effective_param_count = statement->detected_param_count;
+    }
+
+    /* Single parameter set: identical semantics to the normal execute path. */
+    if (state->row_count <= 1) {
+        PGresult *result;
+        if (state->use_prepared) {
+            result = PQexecPrepared(libpq_connection, statement->prepared_name,
+                                    effective_param_count, param_values,
+                                    param_lengths, param_formats, 0);
+        } else {
+            result = PQexecParams(libpq_connection, statement->translated_sql,
+                                  effective_param_count, NULL, param_values,
+                                  param_lengths, param_formats, 0);
+        }
+        parameter_free_libpq_arrays(param_values, param_lengths, param_formats,
+                                    param_count);
+
+        SQLRETURN execution_result = handle_execution_result(statement, result);
+        if (execution_result == SQL_ERROR) {
+            connection_handle_statement_error(statement->parent_connection);
+            /* Streamed large objects open a transaction implicitly under
+             * autocommit (large_object_ensure_transaction). handle_execution_result
+             * left it FAILED and connection_handle_statement_error does not touch
+             * an autocommit connection, so it would stay open and poison every
+             * later statement. Roll it back to restore autocommit cleanliness
+             * (no-op when no such transaction was opened). */
+            statement_rollback_large_object_transaction(statement);
+        } else {
+            /* If a large object was streamed on an autocommit connection, the
+             * driver opened the transaction implicitly; commit it now so the
+             * object and its referencing row persist together. */
+            statement_commit_large_object_transaction(statement);
+        }
+        statement_reset_data_at_exec(statement);
+        return execution_result;
+    }
+
+    /* Array (paramset) binding: execute this set, chain any tuple result. */
+    PGresult *result;
+    if (state->use_prepared) {
+        result = PQexecPrepared(libpq_connection, statement->prepared_name,
+                                effective_param_count, param_values,
+                                param_lengths, param_formats, 0);
+    } else {
+        result = PQexecParams(libpq_connection, statement->translated_sql,
+                              effective_param_count, NULL, param_values,
+                              param_lengths, param_formats, 0);
+    }
+    parameter_free_libpq_arrays(param_values, param_lengths, param_formats,
+                                param_count);
+
+    /* Record per-set status and advance the processed counter, mirroring the
+     * ordinary array-execution bookkeeping. */
+    SQLULEN this_row = state->current_row;
+    ExecStatusType status = result ? PQresultStatus(result) : PGRES_FATAL_ERROR;
+
+    if (status == PGRES_TUPLES_OK) {
+        state->chained_results[state->chained_count++] = result;
+        if (statement->param_status_ptr) {
+            statement->param_status_ptr[this_row] = SQL_PARAM_SUCCESS;
+        }
+    } else if (status == PGRES_COMMAND_OK) {
+        PQclear(result);
+        if (statement->param_status_ptr) {
+            statement->param_status_ptr[this_row] = SQL_PARAM_SUCCESS;
+        }
+    } else {
+        /* A failing set aborts the whole array execution. */
+        diagnostics_clear(&statement->diagnostics);
+        if (result) {
+            error_add_diagnostic_from_result_ctx(&statement->diagnostics, result,
+                                                 "HY000",
+                                                 "Error while executing the query");
+            PQclear(result);
+        }
+        if (statement->param_status_ptr) {
+            statement->param_status_ptr[this_row] = SQL_PARAM_ERROR;
+        }
+        if (statement->parent_connection->transaction_state == TRANSACTION_STATE_ACTIVE) {
+            statement->parent_connection->transaction_state = TRANSACTION_STATE_FAILED;
+        }
+        connection_handle_statement_error(statement->parent_connection);
+        /* As in the single-set path, streamed large objects opened a transaction
+         * implicitly under autocommit; roll it back so it does not stay FAILED
+         * and poison later statements (no-op when none was opened). */
+        statement_rollback_large_object_transaction(statement);
+        statement_reset_data_at_exec(statement);
+        return SQL_ERROR;
+    }
+
+    /* More parameter sets remain: re-arm for the next row and advance the
+     * 1-based processed counter to that next set (the test keys its next chunk
+     * off this value). The caller hands the app the next set's token. */
+    if (this_row + 1 < state->row_count) {
+        data_at_exec_rearm_for_row(statement, this_row + 1);
+        if (statement->params_processed_ptr) {
+            *statement->params_processed_ptr = this_row + 2;
+        }
+        return SQL_NEED_DATA;
+    }
+
+    /* Last set done: publish the collected result-set chain (if any) exactly
+     * like statement_execute_parameter_array does. */
+    int chained_count = state->chained_count;
+    PGresult **chained_results = state->chained_results;
+    state->chained_results = NULL;   /* Ownership moves to the statement now. */
+    state->chained_count = 0;
+    statement_reset_data_at_exec(statement);
+
+    /* All sets succeeded. If any streamed a large object on an autocommit
+     * connection, the driver opened the transaction implicitly; commit it now so
+     * the objects and their referencing rows persist together (no-op otherwise). */
+    statement_commit_large_object_transaction(statement);
+
+    if (chained_count > 0) {
+        statement->pending_results = chained_results;
+        statement->pending_result_count = chained_count;
+        statement->pending_result_index = 1;
+        return apply_result_as_current(statement, chained_results[0]);
+    }
+
+    free(chained_results);
+    statement->has_result_set = false;
+    statement->affected_row_count = (SQLLEN)state->row_count;
+    statement->state = STATEMENT_STATE_EXECUTED;
+    return SQL_SUCCESS;
+}
+
+SQLRETURN statement_param_data(OdbcStatement *statement, SQLPOINTER *value_pointer_out)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+
+    if (!state->in_need_data) {
+        diagnostics_add_record(&statement->diagnostics, "HY010", 0,
+                               "SQLParamData called without a pending "
+                               "SQL_NEED_DATA execution.");
+        return SQL_ERROR;
+    }
+
+    /* Loop so that, for array (paramset) binding, executing one fully-supplied
+     * set flows straight into handing out the NEXT set's first token without a
+     * spurious SQL_NEED_DATA that carries no parameter. */
+    for (;;) {
+        /* Find the next deferred parameter of the current set (after the one
+         * just filled) that still needs data. */
+        int next_index = state->current_parameter_index + 1;
+        for (; next_index < MAX_PARAMETERS; next_index++) {
+            if (state->parameters[next_index].needs_data) {
+                break;
+            }
+        }
+
+        if (next_index < MAX_PARAMETERS) {
+            state->current_parameter_index = next_index;
+            if (value_pointer_out) {
+                /* The token handed back is the ParameterValuePtr the
+                 * application supplied at SQLBindParameter — for a data-at-exec
+                 * parameter this is an application-chosen identifier, not a real
+                 * data buffer. */
+                *value_pointer_out =
+                    statement->parameter_bindings[next_index].value_buffer;
+            }
+            return SQL_NEED_DATA;
+        }
+
+        /* Every deferred parameter of the current set has been supplied.
+         * Execute it. For a single set (or the last set of an array) this
+         * returns the final execution result. For an intermediate set it
+         * returns SQL_NEED_DATA after re-arming; loop to hand out that next
+         * set's first token. */
+        SQLRETURN execution_result = data_at_exec_execute_current_row(statement);
+        if (execution_result != SQL_NEED_DATA) {
+            return execution_result;
+        }
+        /* Intermediate set finished; state was re-armed for the next row with
+         * current_parameter_index reset to the sentinel. Loop to find its first
+         * deferred parameter. */
+    }
+}
+
+SQLRETURN statement_put_data(OdbcStatement *statement, SQLPOINTER data_pointer,
+                             SQLLEN length_or_indicator)
+{
+    DataAtExecState *state = &statement->data_at_exec;
+
+    if (!state->in_need_data ||
+        state->current_parameter_index == DATA_AT_EXEC_NO_CURRENT_PARAMETER) {
+        diagnostics_add_record(&statement->diagnostics, "HY010", 0,
+                               "SQLPutData called without a preceding SQLParamData.");
+        return SQL_ERROR;
+    }
+
+    DataAtExecParameter *parameter = &state->parameters[state->current_parameter_index];
+
+    /* Reject appending to a parameter already marked NULL: a null indicator is
+     * terminal, not an append offset. Must be checked before the length is
+     * resolved so a second chunk after SQL_NULL_DATA is a sequence error. */
+    if (parameter->data_started && parameter->is_null) {
+        diagnostics_add_record(&statement->diagnostics, "HY010", 0,
+                               "Cannot append data after a null parameter indicator.");
+        return SQL_ERROR;
+    }
+
+    /* Mark null/default and stop; further appends will be rejected above. */
+    if (length_or_indicator == SQL_NULL_DATA ||
+        length_or_indicator == SQL_DEFAULT_PARAM) {
+        parameter->data_started = true;
+        parameter->is_null = true;
+        return SQL_SUCCESS;
+    }
+
+    /* Resolve the chunk length. SQL_NTS means a NUL-terminated string. Any other
+     * negative value is not a recognized sentinel and is invalid. */
+    size_t chunk_length;
+    if (length_or_indicator == SQL_NTS) {
+        chunk_length = data_pointer ? strlen((const char *)data_pointer) : 0;
+    } else if (length_or_indicator < 0) {
+        diagnostics_add_record(&statement->diagnostics, "HY024", 0,
+                               "Invalid string or buffer length in SQLPutData.");
+        return SQL_ERROR;
+    } else {
+        chunk_length = (size_t)length_or_indicator;
+    }
+
+    parameter->data_started = true;
+
+    /* Large-object parameter: stream this chunk straight into a large object so
+     * an arbitrarily large value never has to be held in memory. The object is
+     * created (and opened for writing) on the first chunk; every chunk is
+     * appended via lo_write. Only its Oid is remembered for execution. */
+    if (parameter->is_large_object) {
+        OdbcConnection *connection = statement->parent_connection;
+        PGconn *libpq_connection = connection->libpq_connection;
+
+        if (parameter->large_object_fd < 0) {
+            if (large_object_ensure_transaction(connection) != SQL_SUCCESS) {
+                diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                       "Could not begin a transaction for the large object.");
+                return SQL_ERROR;
+            }
+            parameter->large_object_oid = large_object_create(libpq_connection);
+            if (parameter->large_object_oid == InvalidOid) {
+                diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                       "Could not create the large object.");
+                return SQL_ERROR;
+            }
+            parameter->large_object_fd = large_object_open(
+                libpq_connection, parameter->large_object_oid,
+                LARGE_OBJECT_MODE_WRITE);
+            if (parameter->large_object_fd < 0) {
+                diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                       "Could not open the large object for writing.");
+                return SQL_ERROR;
+            }
+        }
+
+        if (chunk_length > 0 && data_pointer &&
+            large_object_write(libpq_connection, parameter->large_object_fd,
+                               (const char *)data_pointer, chunk_length) < 0) {
+            diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                   "Could not write to the large object.");
+            return SQL_ERROR;
+        }
+        /* Track the total for informational purposes only; the value sent is the
+         * Oid, not these bytes. */
+        parameter->length += (SQLLEN)chunk_length;
+        return SQL_SUCCESS;
+    }
+
+    /* Grow the accumulation buffer to hold the new chunk plus a trailing NUL
+     * (the NUL lets the buffer double as a C string for text parameters). */
+    size_t required_capacity = (size_t)parameter->length + chunk_length + 1;
+    if (required_capacity > parameter->capacity) {
+        size_t new_capacity = parameter->capacity ? parameter->capacity : 16;
+        while (new_capacity < required_capacity) {
+            new_capacity *= 2;
+        }
+        char *grown = realloc(parameter->buffer, new_capacity);
+        if (!grown) {
+            diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                   "Memory allocation failed accumulating "
+                                   "SQLPutData chunk.");
+            return SQL_ERROR;
+        }
+        parameter->buffer = grown;
+        parameter->capacity = new_capacity;
+    }
+
+    if (chunk_length > 0 && data_pointer) {
+        memcpy(parameter->buffer + parameter->length, data_pointer, chunk_length);
+    }
+    parameter->length += (SQLLEN)chunk_length;
+    parameter->buffer[parameter->length] = '\0';
+
+    return SQL_SUCCESS;
+}
+
+/* ---- Large-object read-back (SQLGetData on a "lo" column) ---- */
+
+void statement_reset_large_object_read(OdbcStatement *statement)
+{
+    if (statement->large_object_read_fd >= 0 &&
+        statement->parent_connection &&
+        statement->parent_connection->libpq_connection) {
+        large_object_close(statement->parent_connection->libpq_connection,
+                           statement->large_object_read_fd);
+    }
+    statement->large_object_read_fd = -1;
+    statement->large_object_read_column = -1;
+    statement->large_object_read_row = -1;
+    statement->large_object_read_bytes_remaining = -1;
+}
+
+SQLRETURN statement_get_large_object_data(OdbcStatement *statement,
+                                          int column_index,
+                                          int row_index,
+                                          const char *raw_oid_text,
+                                          SQLPOINTER target_value,
+                                          SQLLEN buffer_length,
+                                          SQLLEN *indicator_or_length)
+{
+    OdbcConnection *connection = statement->parent_connection;
+    PGconn *libpq_connection = connection->libpq_connection;
+    /* Key the chunked-read state on the exact row being populated, supplied by
+     * the caller. The SQLGetData path passes current_row_position, but the
+     * block-cursor bound path populates first_row+offset while leaving
+     * current_row_position pinned until the rowset completes; keying on the
+     * caller's row keeps a truncated LO's open fd matched to the right row so the
+     * next rowset row for the same column correctly starts a fresh read. */
+    int current_row = row_index;
+
+    /* A large-object Oid of 0 means SQL NULL, exactly as the original driver
+     * treats it (a "lo" column with no object stores 0). */
+    Oid object_id = (Oid)strtoul(raw_oid_text, NULL, 10);
+    if (object_id == InvalidOid) {
+        if (indicator_or_length) {
+            *indicator_or_length = SQL_NULL_DATA;
+        } else {
+            diagnostics_add_record(&statement->diagnostics, "22002", 0,
+                                   "NULL large object retrieved but no indicator provided.");
+            return SQL_ERROR;
+        }
+        return SQL_SUCCESS;
+    }
+
+    /* If a previous read was for a different row or column, abandon it — a new
+     * value is being read from the start. */
+    if (statement->large_object_read_fd >= 0 &&
+        (statement->large_object_read_column != column_index ||
+         statement->large_object_read_row != current_row)) {
+        statement_reset_large_object_read(statement);
+    }
+
+    /* First call for this row/column: open the object and probe its total size
+     * so truncation and the remaining-bytes indicator can be reported. */
+    if (statement->large_object_read_fd < 0) {
+        if (large_object_ensure_transaction(connection) != SQL_SUCCESS) {
+            diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                   "Could not begin a transaction to read the large object.");
+            return SQL_ERROR;
+        }
+        int descriptor = large_object_open(libpq_connection, object_id,
+                                           LARGE_OBJECT_MODE_READ);
+        if (descriptor < 0) {
+            diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                                   "Could not open the large object for reading.");
+            return SQL_ERROR;
+        }
+        /* Size = seek to end, read position, seek back to start. */
+        int total_size = large_object_seek(libpq_connection, descriptor, 0, SEEK_END);
+        large_object_seek(libpq_connection, descriptor, 0, SEEK_SET);
+
+        statement->large_object_read_fd = descriptor;
+        statement->large_object_read_column = column_index;
+        statement->large_object_read_row = current_row;
+        statement->large_object_read_bytes_remaining =
+            total_size >= 0 ? total_size : -1;
+    } else if (statement->large_object_read_bytes_remaining == 0) {
+        /* The whole object was already delivered by earlier chunks. */
+        statement_reset_large_object_read(statement);
+        return SQL_NO_DATA;
+    }
+
+    long long bytes_remaining_before = statement->large_object_read_bytes_remaining;
+    bool size_known = (bytes_remaining_before >= 0);
+
+    /* Report the bytes still outstanding before this read, per the ODBC chunked
+     * SQLGetData contract (the indicator is the total remaining, which may be
+     * larger than the buffer). When the size probe (seek to END) failed the
+     * total is unknown: report SQL_NO_TOTAL rather than -1, which the
+     * application would otherwise misread as SQL_NULL_DATA. */
+    if (indicator_or_length) {
+        *indicator_or_length = size_known ? (SQLLEN)bytes_remaining_before
+                                          : (SQLLEN)SQL_NO_TOTAL;
+    }
+
+    /* A zero-length (or absent) buffer is a valid way to query the length. */
+    if (!target_value || buffer_length <= 0) {
+        return SQL_SUCCESS;
+    }
+
+    int bytes_read = large_object_read(libpq_connection,
+                                       statement->large_object_read_fd,
+                                       (char *)target_value, (size_t)buffer_length);
+    if (bytes_read < 0) {
+        statement_reset_large_object_read(statement);
+        diagnostics_add_record(&statement->diagnostics, "HY000", 0,
+                               "Error reading from the large object.");
+        return SQL_ERROR;
+    }
+
+    if (statement->large_object_read_bytes_remaining > 0) {
+        statement->large_object_read_bytes_remaining -= bytes_read;
+    }
+
+    /* Decide whether this read exhausted the object. When the total size is
+     * known, it is done once the buffer held everything that remained. When the
+     * size is unknown (probe failed), a short read — fewer bytes than the buffer
+     * could hold — signals end-of-object; a full buffer means "possibly more",
+     * so we must report truncation and let the app call again. */
+    bool fully_read;
+    if (size_known) {
+        fully_read = ((long long)bytes_read >= bytes_remaining_before) ||
+                     statement->large_object_read_bytes_remaining == 0;
+    } else {
+        fully_read = ((SQLLEN)bytes_read < buffer_length);
+    }
+
+    /* If the object is fully read, close it and, on an autocommit connection,
+     * commit the implicit read transaction. */
+    if (fully_read) {
+        statement_reset_large_object_read(statement);
+        statement_commit_large_object_transaction(statement);
+        return SQL_SUCCESS;
+    }
+
+    diagnostics_add_record(&statement->diagnostics, "01004", 0,
+                           "Large object data was truncated in SQLGetData.");
+    return SQL_SUCCESS_WITH_INFO;
 }
 
 SQLRETURN statement_close_cursor(OdbcStatement *statement)

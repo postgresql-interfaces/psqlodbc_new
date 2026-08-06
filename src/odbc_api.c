@@ -466,6 +466,8 @@ SQLGetFunctions(SQLHDBC       connection_handle,
         SQL_API_SQLGETDESCREC,
         SQL_API_SQLSETDESCREC,
         SQL_API_SQLCOPYDESC,
+        SQL_API_SQLPARAMDATA,
+        SQL_API_SQLPUTDATA,
     };
     int num_supported = (int)(sizeof(supported_functions) / sizeof(supported_functions[0]));
 
@@ -4215,6 +4217,82 @@ SQLNumParams(SQLHSTMT     statement_handle,
     }
 
     return SQL_SUCCESS;
+}
+
+/**
+ * SQLParamData — Drive the data-at-execution parameter-streaming protocol.
+ *
+ * After SQLExecute/SQLExecDirect returns SQL_NEED_DATA (because one or more
+ * bound parameters were flagged SQL_DATA_AT_EXEC), the application calls
+ * SQLParamData repeatedly. Each call that returns SQL_NEED_DATA sets
+ * *value_pointer_out to the next parameter's application-supplied value pointer
+ * (the token from SQLBindParameter's ParameterValuePtr) so the application knows
+ * which parameter to supply next via SQLPutData. When every deferred parameter
+ * has been supplied, SQLParamData executes the statement and returns the
+ * execution result (SQL_SUCCESS, SQL_ERROR, etc.).
+ *
+ * Parameters:
+ *   statement_handle - A valid statement handle in the SQL_NEED_DATA state.
+ *   value_pointer_out - Output: token identifying the parameter needing data.
+ *
+ * Returns:
+ *   SQL_NEED_DATA      - Another parameter still needs data (token returned).
+ *   SQL_SUCCESS / etc. - All data supplied; the statement was executed.
+ *   SQL_ERROR          - Protocol misuse or execution failure.
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlparamdata-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLParamData(SQLHSTMT    statement_handle,
+             SQLPOINTER *value_pointer_out)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return statement_param_data(statement, value_pointer_out);
+}
+
+/**
+ * SQLPutData — Supply one chunk of a data-at-execution parameter's value.
+ *
+ * Called after SQLParamData has identified the current parameter. Each call
+ * appends a chunk of bytes to that parameter's accumulated value; an
+ * application may call SQLPutData several times to stream a large value in
+ * pieces. SQL_NTS treats the data as a NUL-terminated string; SQL_NULL_DATA
+ * marks the parameter as SQL NULL.
+ *
+ * Parameters:
+ *   statement_handle    - A valid statement handle mid-protocol.
+ *   data_pointer        - Pointer to the chunk of data to append.
+ *   length_or_indicator - Byte length of the chunk, SQL_NTS, or SQL_NULL_DATA.
+ *
+ * Returns:
+ *   SQL_SUCCESS        - Chunk accepted.
+ *   SQL_ERROR          - Invalid length (HY024) or sequence error (HY010).
+ *   SQL_INVALID_HANDLE - statement_handle is not a valid statement handle.
+ *
+ * See: https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlputdata-function
+ */
+PSQLODBC2_EXPORT SQLRETURN SQL_API
+SQLPutData(SQLHSTMT   statement_handle,
+           SQLPOINTER data_pointer,
+           SQLLEN     length_or_indicator)
+{
+    OdbcStatement *statement = (OdbcStatement *)statement_handle;
+
+    if (!statement || statement->magic_number != STATEMENT_MAGIC_NUMBER) {
+        return SQL_INVALID_HANDLE;
+    }
+
+    diagnostics_clear(&statement->diagnostics);
+
+    return statement_put_data(statement, data_pointer, length_or_indicator);
 }
 
 /**

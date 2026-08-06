@@ -215,6 +215,17 @@ typedef struct OdbcConnection {
      * rows UNUSED). Defaults to DEFAULT_BATCH_SIZE. A value <= 0 is treated as
      * the default. */
     int batch_size;
+
+    /* PostgreSQL large objects are referenced from ordinary tables through a
+     * per-database DOMAIN named "lo" built over the base type "oid". The domain
+     * has no fixed OID (it is created per database), so we look it up at connect
+     * time (see connection_lookup_large_object_type). large_object_type_oid holds
+     * that domain's OID (InvalidOid when the database has no "lo" domain), and
+     * large_object_is_domain records whether it is genuinely a domain over "oid"
+     * (versus a bare base type). These let parameter and result handling
+     * recognize large-object references. */
+    Oid large_object_type_oid;
+    bool large_object_is_domain;
 } OdbcConnection;
 
 /* Default array-execution batch size when the application has not set
@@ -250,6 +261,16 @@ void connection_clear_notices(OdbcConnection *connection);
  * inside ordinary '...' string literals.
  */
 bool connection_standard_conforming_strings(const OdbcConnection *connection);
+
+/*
+ * Return whether the given PostgreSQL type OID denotes a large-object reference
+ * for this connection. True when the OID is the database's "lo" domain OID (as
+ * reported for a bound parameter), or — when that domain exists over "oid" — the
+ * base "oid" type itself (as a "lo" column's values report on read-back). Always
+ * false when the database has no "lo" domain. Mirrors the original psqlodbc's
+ * lobj_type / lo_is_domain checks.
+ */
+bool connection_type_is_large_object(const OdbcConnection *connection, Oid type_oid);
 
 /* ---- Public Interface ---- */
 

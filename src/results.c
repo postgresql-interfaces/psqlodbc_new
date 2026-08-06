@@ -1169,16 +1169,29 @@ static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
         int raw_value_length = (int)strlen(raw_value);
 
         unsigned int col_oid = (unsigned int)PQftype(statement->current_result, column_index);
-        /* Per-column ARD SQL_DESC_PRECISION override (interval fractional secs).
-         * column_index is 0-based, matching the override array. */
-        int fraction_precision = (column_index < MAX_BOUND_COLUMNS)
-                                     ? statement->column_precision_override[column_index]
-                                     : -1;
-        SQLRETURN conversion_result = convert_value_to_c_type(
-            statement, raw_value, raw_value_length,
-            resolved_type, element_buffer,
-            binding->buffer_length, element_indicator,
-            col_oid, fraction_precision);
+
+        /* Large-object columns hold a large object's Oid, not the bytes. When a
+         * "lo" column is bound as SQL_C_BINARY, stream the object's contents into
+         * the bound buffer instead of copying the Oid text — the same dispatch
+         * results_get_data performs for SQLGetData (see there for rationale). */
+        SQLRETURN conversion_result;
+        if (resolved_type == SQL_C_BINARY &&
+            connection_type_is_large_object(statement->parent_connection, col_oid)) {
+            conversion_result = statement_get_large_object_data(
+                statement, column_index, source_row, raw_value,
+                element_buffer, binding->buffer_length, element_indicator);
+        } else {
+            /* Per-column ARD SQL_DESC_PRECISION override (interval fractional
+             * secs). column_index is 0-based, matching the override array. */
+            int fraction_precision = (column_index < MAX_BOUND_COLUMNS)
+                                         ? statement->column_precision_override[column_index]
+                                         : -1;
+            conversion_result = convert_value_to_c_type(
+                statement, raw_value, raw_value_length,
+                resolved_type, element_buffer,
+                binding->buffer_length, element_indicator,
+                col_oid, fraction_precision);
+        }
 
         /* Escalate overall result if any column was truncated */
         if (conversion_result == SQL_SUCCESS_WITH_INFO) {
@@ -1684,6 +1697,10 @@ SQLRETURN results_fetch(OdbcStatement *statement)
 
     int total_rows = PQntuples(statement->current_result);
 
+    /* Moving to a new row invalidates any in-progress large-object read from the
+     * previous row, so close it before advancing the cursor. */
+    statement_reset_large_object_read(statement);
+
     statement->current_row_position++;
 
     if (statement->current_row_position >= total_rows) {
@@ -2041,6 +2058,21 @@ SQLRETURN results_get_data(OdbcStatement *statement,
     }
 
     unsigned int col_oid = (unsigned int)PQftype(statement->current_result, column_index);
+
+    /* Large-object columns store the Oid of a large object, not the bytes
+     * themselves. When the application reads such a column as binary, stream the
+     * object's contents back (chunked) rather than returning the Oid text. This
+     * mirrors the original driver's convert_lo path. Other target types fall
+     * through to the normal conversion, which returns the Oid as text. */
+    if (resolved_type == SQL_C_BINARY &&
+        connection_type_is_large_object(statement->parent_connection, col_oid)) {
+        return statement_get_large_object_data(statement, column_index,
+                                               statement->current_row_position,
+                                               raw_value,
+                                               target_value, buffer_length,
+                                               indicator_or_length);
+    }
+
     int fraction_precision = (column_index < MAX_BOUND_COLUMNS)
                                  ? statement->column_precision_override[column_index]
                                  : -1;

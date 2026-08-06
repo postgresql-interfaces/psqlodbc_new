@@ -115,6 +115,71 @@ typedef struct KeysetSavepoint {
  * cursor names at 32 characters; we match it for drop-in compatibility. */
 #define MAX_CURSOR_NAME_LENGTH 32
 
+/* ---- Data-at-execution (SQL_DATA_AT_EXEC) streaming ----
+ *
+ * When a bound parameter's length/indicator is SQL_DATA_AT_EXEC (or the
+ * SQL_LEN_DATA_AT_EXEC(length) form), the application does not supply the value
+ * at SQLBindParameter/SQLExecute time. Instead SQLExecute returns SQL_NEED_DATA
+ * and the application streams each such parameter's bytes afterward:
+ *
+ *   SQLExecute            -> SQL_NEED_DATA
+ *   loop:
+ *     SQLParamData(&token)  -> SQL_NEED_DATA, token = next param's value pointer
+ *     SQLPutData(chunk,len) -> one or more times, appended to a growing buffer
+ *   SQLParamData           -> executes the statement, returns SQL_SUCCESS etc.
+ *
+ * The per-parameter accumulation and the walk-through cursor below back that
+ * protocol. See statement_data_at_exec_* helpers in statement.c. */
+
+/* Sentinel for "no parameter is currently being filled" in the data-at-exec
+ * walk. SQLParamData advances current_parameter_index to the next parameter
+ * that still needs data; SQLPutData appends to that parameter. */
+#define DATA_AT_EXEC_NO_CURRENT_PARAMETER (-1)
+
+/* Accumulated bytes and status for one data-at-execution parameter. The buffer
+ * grows via realloc as SQLPutData chunks arrive; when the application signals
+ * SQL_NULL_DATA the parameter is marked null and further appends are rejected
+ * (HY010) to match the ODBC function-sequence contract. */
+typedef struct DataAtExecParameter {
+    bool needs_data;          /* True if this parameter was bound SQL_DATA_AT_EXEC */
+    bool data_started;        /* True once the first SQLPutData chunk arrived */
+    bool is_null;             /* True if SQLPutData supplied SQL_NULL_DATA */
+    char *buffer;             /* Growing heap buffer of accumulated bytes (NUL-terminated) */
+    SQLLEN length;            /* Number of valid bytes in buffer (excludes the NUL) */
+    size_t capacity;          /* Allocated size of buffer in bytes */
+
+    /* ---- Large-object streaming ----
+     *
+     * When this parameter targets a "lo" (large object) column, its streamed
+     * bytes are NOT accumulated in the buffer above; that could be arbitrarily
+     * large. Instead the first SQLPutData chunk creates a large object and each
+     * chunk is written straight to it via lo_write, so only the current chunk is
+     * ever held in memory. At execution the parameter's value becomes the
+     * large object's Oid (as decimal text), matching how PostgreSQL stores a
+     * "lo" column. */
+    bool is_large_object;     /* True if this deferred parameter writes to a large object */
+    Oid large_object_oid;     /* Oid of the created large object (InvalidOid until first chunk) */
+    int large_object_fd;      /* Open write descriptor, or -1 when none is open */
+} DataAtExecParameter;
+
+/* Statement-wide data-at-execution state, active between the SQLExecute that
+ * returned SQL_NEED_DATA and the final SQLParamData that executes the query. */
+typedef struct DataAtExecState {
+    bool in_need_data;                 /* True while the NEED_DATA protocol is running */
+    bool use_prepared;                 /* Execute via PQexecPrepared (true) or PQexecParams */
+    int current_parameter_index;       /* 0-based param being filled, or the sentinel above */
+    SQLULEN current_row;               /* Parameter set (row) being filled, for paramset > 1 */
+    SQLULEN row_count;                 /* Number of parameter sets (snapshot of paramset_size) */
+    DataAtExecParameter parameters[MAX_PARAMETERS];  /* Per-parameter accumulation */
+
+    /* Tuple-bearing result sets collected one per executed parameter set, so a
+     * data-at-execution array execution can chain them for SQLMoreResults
+     * exactly like the ordinary array-execution path. Allocated at row_count
+     * entries when the protocol begins. */
+    PGresult **chained_results;
+    int chained_count;
+} DataAtExecState;
+
 /* Storage size for a cursor name: the maximum name length plus room for the
  * terminating NUL. Auto-generated fallback names ("SQL_CUR<hex-pointer>") also
  * fit comfortably within this bound. */
@@ -130,6 +195,32 @@ typedef struct OdbcStatement {
     bool is_prepared;                  /* True if PQprepare was called for this statement */
     char *translated_sql;              /* Heap-allocated SQL with ? translated to $N (NULL if none) */
     int detected_param_count;          /* Number of ? markers found during translation */
+
+    /* PostgreSQL parameter type OIDs captured from PQdescribePrepared at prepare
+     * time, one per marker (index N-1 for $N). Retained separately because the
+     * describe PGresult is cleared before parameters are converted, and the
+     * execute path needs these to recognize large-object ("lo") parameters,
+     * whose values must be sent as a large object's Oid rather than as bytea.
+     * A value of InvalidOid (0) means "unknown / not captured". */
+    Oid parameter_type_oids[MAX_PARAMETERS];
+    int parameter_type_oid_count;
+
+    /* ---- Large-object read-back state (SQLGetData on a "lo" column) ----
+     *
+     * A "lo" column holds the Oid of a large object; reading it as SQL_C_BINARY
+     * opens that object and streams its bytes back, possibly across several
+     * SQLGetData calls (chunked retrieval). This tracks the object currently
+     * open for read and how many bytes remain, so successive SQLGetData calls
+     * continue where the previous one stopped, exactly like the original driver.
+     *
+     * large_object_read_column is the 0-based result column being streamed, or
+     * -1 when no read is in progress; a change of column or row resets the read.
+     * large_object_read_bytes_remaining is the number of unread bytes left in the
+     * object, or -1 before the size has been probed. */
+    int large_object_read_fd;                  /* Open read descriptor, or -1 */
+    int large_object_read_column;              /* 0-based column being read, or -1 */
+    int large_object_read_row;                 /* Row index the open read belongs to */
+    long long large_object_read_bytes_remaining;   /* Unread bytes left, or -1 if unprobed */
 
     /* Procedure-call metadata from the ODBC-escape analysis of the SQL text.
      * When is_procedure_call is true, bound arguments are sent to PostgreSQL
@@ -343,6 +434,12 @@ typedef struct OdbcStatement {
      * "ROLLBACK TO <name>". Kept on the owning cursor statement. */
     KeysetSavepoint keyset_savepoints[MAX_KEYSET_SAVEPOINTS];
     int keyset_savepoint_count;
+
+    /* Data-at-execution streaming state (SQL_DATA_AT_EXEC). Populated when
+     * SQLExecute detects at least one deferred-value parameter and returns
+     * SQL_NEED_DATA; consumed by SQLParamData / SQLPutData. Inactive
+     * (in_need_data == false) at all other times. */
+    DataAtExecState data_at_exec;
 } OdbcStatement;
 
 /* ---- Bookmark encoding ----
@@ -500,5 +597,99 @@ SQLRETURN statement_set_pos(OdbcStatement *statement,
  */
 SQLRETURN statement_bulk_operations(OdbcStatement *statement,
                                     SQLUSMALLINT operation);
+
+/* ---- Data-at-execution (SQL_DATA_AT_EXEC) helpers ---- */
+
+/*
+ * Return true if a length/indicator value marks a data-at-execution parameter,
+ * i.e. it is SQL_DATA_AT_EXEC or the SQL_LEN_DATA_AT_EXEC(length) form (any
+ * value at or below SQL_LEN_DATA_AT_EXEC_OFFSET). Used by both the execute
+ * paths (to decide whether to defer) and by parameter binding.
+ */
+bool statement_length_is_data_at_exec(SQLLEN length_or_indicator);
+
+/*
+ * Scan the statement's bound parameters for the given parameter set (row) and
+ * return true if any of them was bound with a data-at-execution indicator. Used
+ * by statement_execute / statement_exec_direct to decide whether to return
+ * SQL_NEED_DATA instead of executing immediately.
+ */
+bool statement_row_has_data_at_exec(const OdbcStatement *statement, SQLULEN row_index);
+
+/*
+ * Enter the data-at-execution NEED_DATA state: reset the per-parameter
+ * accumulation buffers and mark which parameters of the given row need data.
+ * use_prepared records whether the eventual execution should use PQexecPrepared
+ * (SQLExecute) or PQexecParams (SQLExecDirect). After this the statement is
+ * ready for the SQLParamData / SQLPutData loop.
+ */
+void statement_begin_data_at_exec(OdbcStatement *statement, bool use_prepared,
+                                  SQLULEN row_index);
+
+/*
+ * Release all data-at-execution accumulation buffers and reset the state to
+ * inactive. Safe to call when the state is already inactive. Called when the
+ * protocol completes, when the cursor is closed, and when the handle is freed.
+ */
+void statement_reset_data_at_exec(OdbcStatement *statement);
+
+/*
+ * Advance the data-at-execution walk to the next parameter still needing data.
+ *
+ * Backs SQLParamData. When another parameter of the current row needs data,
+ * sets *value_pointer_out to that parameter's application value pointer (the
+ * "token" the app passed as ParameterValuePtr) and returns SQL_NEED_DATA. When
+ * every deferred parameter of the current row has been supplied, executes the
+ * statement (advancing to the next parameter set for paramset binding) and
+ * returns the execution result.
+ */
+SQLRETURN statement_param_data(OdbcStatement *statement, SQLPOINTER *value_pointer_out);
+
+/*
+ * Append one chunk of streamed data to the current data-at-execution parameter.
+ *
+ * Backs SQLPutData. Handles SQL_NTS (strlen), SQL_NULL_DATA (mark the parameter
+ * null), and SQL_DEFAULT_PARAM. Rejects an unrecognized negative length with
+ * SQLSTATE HY024, and an append after the parameter was set null with HY010.
+ */
+SQLRETURN statement_put_data(OdbcStatement *statement, SQLPOINTER data_pointer,
+                             SQLLEN length_or_indicator);
+
+/*
+ * Stream a large-object column value back to the application (SQLGetData with
+ * target type SQL_C_BINARY on a "lo" column).
+ *
+ * raw_oid_text is the column's text value: the decimal Oid of the large object.
+ * The first call for a given row/column opens the object and probes its size;
+ * successive calls continue reading where the previous one left off, so a value
+ * larger than the buffer is retrieved in chunks. On each call the indicator (if
+ * provided) receives the number of bytes still remaining before this call, per
+ * the ODBC chunked-retrieval contract.
+ *
+ * row_index is the result-set row being read. The in-progress read state is
+ * keyed on it so a chunked read resumes only for the same row/column: callers
+ * pass current_row_position for SQLGetData, or the actual populated row
+ * (first_row + offset) on the block-cursor bound-column path, where
+ * current_row_position stays pinned until the rowset completes.
+ *
+ * Returns SQL_SUCCESS when the whole (remaining) value fit,
+ * SQL_SUCCESS_WITH_INFO with SQLSTATE 01004 when it was truncated (more chunks
+ * remain), SQL_NO_DATA when there is nothing left to read, or SQL_ERROR.
+ */
+SQLRETURN statement_get_large_object_data(OdbcStatement *statement,
+                                          int column_index,
+                                          int row_index,
+                                          const char *raw_oid_text,
+                                          SQLPOINTER target_value,
+                                          SQLLEN buffer_length,
+                                          SQLLEN *indicator_or_length);
+
+/*
+ * Reset any in-progress large-object read (close the descriptor and forget the
+ * remaining-byte count). Called when the cursor moves to another row or column,
+ * when the result set is cleared, and when the handle is freed, so a stale
+ * descriptor from a previous read cannot bleed into the next one.
+ */
+void statement_reset_large_object_read(OdbcStatement *statement);
 
 #endif /* PSQLODBC2_STATEMENT_H */

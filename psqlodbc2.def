@@ -54,3 +54,5 @@ EXPORTS
     SQLGetDescRec       @52
     SQLSetDescRec       @53
     SQLCopyDesc         @54
+    SQLParamData        @55
+    SQLPutData          @56

@@ -15,6 +15,7 @@
 #include "environment.h"
 #include "connection_string.h"
 #include "error_mapping.h"
+#include "type_mapping.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -93,6 +94,12 @@ SQLRETURN connection_allocate(OdbcEnvironment *environment, SQLHANDLE *output_ha
     connection->connection_timeout = 0;
     connection->access_mode = SQL_MODE_READ_WRITE;
     connection->batch_size = DEFAULT_BATCH_SIZE;
+
+    /* No "lo" large-object domain is known until connect time discovers one
+     * (connection_lookup_large_object_type). Start with InvalidOid so the
+     * large-object code paths stay dormant on databases without a "lo" domain. */
+    connection->large_object_type_oid = InvalidOid;
+    connection->large_object_is_domain = false;
 
     if (!environment_add_connection(environment, connection)) {
         /* Environment's connection array is full */
@@ -185,6 +192,69 @@ bool connection_standard_conforming_strings(const OdbcConnection *connection)
         return true;
     }
     return strcmp(status, "on") == 0;
+}
+
+/*
+ * Discover the database's "lo" large-object domain, if it exists. The "lo"
+ * type ships with the lo contrib module as a DOMAIN over the base type "oid",
+ * used so a table column can hold the OID of a large object. Because the domain
+ * is created per database it has no fixed type OID, so we look it up here.
+ *
+ * On success sets large_object_type_oid to the domain's own OID and, when the
+ * domain's base type is "oid", large_object_is_domain to true. When no such
+ * domain exists the fields are left at their InvalidOid/false defaults and the
+ * large-object code paths simply never trigger. A query failure is non-fatal —
+ * connections that never use large objects must still succeed.
+ */
+static void connection_lookup_large_object_type(OdbcConnection *connection)
+{
+    /* typbasetype is the OID of the domain's underlying base type (0 for a
+     * non-domain). We only support a "lo" domain built directly on "oid". */
+    PGresult *result = PQexec(connection->libpq_connection,
+                              "SELECT oid, typbasetype FROM pg_type "
+                              "WHERE typname = 'lo'");
+    if (!result) {
+        return;
+    }
+    if (PQresultStatus(result) == PGRES_TUPLES_OK && PQntuples(result) > 0) {
+        Oid domain_oid = (Oid)strtoul(PQgetvalue(result, 0, 0), NULL, 10);
+        Oid base_type_oid = (Oid)strtoul(PQgetvalue(result, 0, 1), NULL, 10);
+
+        if (base_type_oid == PG_TYPE_OID) {
+            /* The supported case: a domain over "oid". */
+            connection->large_object_type_oid = domain_oid;
+            connection->large_object_is_domain = true;
+        } else if (base_type_oid == InvalidOid) {
+            /* A bare "lo" base type (no modern server ships one, but mirror the
+             * original driver's handling): usable as-is, not a domain. */
+            connection->large_object_type_oid = domain_oid;
+            connection->large_object_is_domain = false;
+        }
+        /* A "lo" domain over some OTHER base type is not something we handle;
+         * leave the fields at their defaults so the LO paths stay dormant. */
+    }
+    PQclear(result);
+}
+
+bool connection_type_is_large_object(const OdbcConnection *connection, Oid type_oid)
+{
+    if (!connection || connection->large_object_type_oid == InvalidOid) {
+        return false;
+    }
+
+    /* A parameter bound to a "lo" column resolves to the domain's own OID. */
+    if (type_oid == connection->large_object_type_oid) {
+        return true;
+    }
+
+    /* On read-back a "lo" column's values report as the base type "oid" (the
+     * domain collapses to its base in a result descriptor), so treat a plain
+     * "oid" value as a large-object reference when a "lo" domain exists. */
+    if (connection->large_object_is_domain && type_oid == PG_TYPE_OID) {
+        return true;
+    }
+
+    return false;
 }
 
 /*
@@ -294,6 +364,12 @@ SQLRETURN connection_connect(OdbcConnection *connection)
     connection->max_bytes_per_char =
         max_bytes_per_char_for_encoding(pg_encoding_to_char(PQclientEncoding(connection->libpq_connection)));
 
+    /* Detect the database's "lo" large-object domain, if any, so parameter and
+     * result handling can recognize large-object references. Runs as its own
+     * simple query outside any transaction (autocommit is ON at connect), so it
+     * cannot disturb an application transaction. */
+    connection_lookup_large_object_type(connection);
+
     return SQL_SUCCESS;
 }
 
@@ -322,6 +398,11 @@ SQLRETURN connection_disconnect(OdbcConnection *connection)
     connection->state = CONNECTION_STATE_NOT_CONNECTED;
     connection->server_version_major = 0;
     connection->server_version_minor = 0;
+
+    /* The "lo" domain OID is database-specific; a future reconnect (possibly to
+     * a different database) must rediscover it rather than reuse a stale value. */
+    connection->large_object_type_oid = InvalidOid;
+    connection->large_object_is_domain = false;
 
     return SQL_SUCCESS;
 }
