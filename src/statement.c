@@ -808,6 +808,147 @@ static SQLRETURN statement_substitute_inline_large_objects(OdbcStatement *statem
 }
 
 /*
+ * True if parameter marker (0-based) index has a server-inferred type of
+ * date, timestamp, or timestamptz. Used by CvtNullDate to decide whether an
+ * empty bound string should be turned into SQL NULL. Matches the type set the
+ * original psqlodbc's cvt_null_date logic checks (DATE, TIMESTAMP, TIMESTAMPTZ;
+ * plain TIME is intentionally excluded). Returns false when the parameter type
+ * was not captured (e.g. the describe failed).
+ */
+static bool statement_parameter_is_datetime(const OdbcStatement *statement,
+                                            int index)
+{
+    if (index < 0 || index >= statement->parameter_type_oid_count) {
+        return false;
+    }
+    Oid type_oid = statement->parameter_type_oids[index];
+    return type_oid == PG_TYPE_DATE ||
+           type_oid == PG_TYPE_TIMESTAMP ||
+           type_oid == PG_TYPE_TIMESTAMPTZ;
+}
+
+/*
+ * True when CvtNullDate is enabled and some bound parameter of this statement is
+ * an empty character/wide-character string — the only case that can be rewritten
+ * to NULL. Cheap guard so the common path (option off, or no empty strings) pays
+ * nothing, and so the extra Parse/Describe used to learn parameter types on the
+ * direct-execution path is only issued when it could matter. row_index selects
+ * the parameter set for array binding (0 for a single set).
+ */
+static bool statement_has_cvt_null_date_candidate(const OdbcStatement *statement,
+                                                  SQLULEN row_index)
+{
+    if (!statement->parent_connection ||
+        !statement->parent_connection->info.cvt_null_date) {
+        return false;
+    }
+    int count = statement->detected_param_count;
+    if (count > MAX_PARAMETERS) {
+        count = MAX_PARAMETERS;
+    }
+    for (int index = 0; index < count; index++) {
+        const ParameterBinding *binding = &statement->parameter_bindings[index];
+        if (!binding->is_bound || !binding->value_buffer) {
+            continue;
+        }
+        if (binding->c_type != SQL_C_CHAR && binding->c_type != SQL_C_WCHAR) {
+            continue;
+        }
+        /* A NULL indicator means "not NULL"; only SQL_NULL_DATA is NULL. */
+        SQLLEN indicator = binding->indicator_or_length
+                               ? binding->indicator_or_length[row_index]
+                               : SQL_NTS;
+        if (indicator == SQL_NULL_DATA) {
+            continue;
+        }
+        /* Empty string: either an explicit zero length, or SQL_NTS pointing at a
+         * value whose first unit is the terminator. */
+        bool is_empty;
+        if (indicator == SQL_NTS) {
+            if (binding->c_type == SQL_C_WCHAR) {
+                is_empty = ((const SQLWCHAR *)binding->value_buffer)[0] == 0;
+            } else {
+                is_empty = ((const char *)binding->value_buffer)[0] == '\0';
+            }
+        } else {
+            is_empty = (indicator == 0);
+        }
+        if (is_empty) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * CvtNullDate substitution: for every bound parameter that is an empty string
+ * targeting a date/timestamp column, replace its slot in the libpq value arrays
+ * with SQL NULL (a NULL value pointer). PostgreSQL rejects "" as a date, so this
+ * lets applications that represent a null date with an empty string insert NULL,
+ * matching the original psqlodbc's cvt_null_date behavior. The empty-string
+ * value the converter allocated is freed first. Requires parameter_type_oids to
+ * have been captured (see the callers). row_index selects the parameter set for
+ * array binding (0 for a single set).
+ */
+static void statement_apply_cvt_null_date(OdbcStatement *statement,
+                                          const char **values,
+                                          int *lengths,
+                                          int param_count,
+                                          SQLULEN row_index)
+{
+    for (int index = 0; index < param_count && index < MAX_PARAMETERS; index++) {
+        const ParameterBinding *binding = &statement->parameter_bindings[index];
+        if (binding->c_type != SQL_C_CHAR && binding->c_type != SQL_C_WCHAR) {
+            continue;
+        }
+        /* Only an already-converted, non-NULL, empty value is a candidate. */
+        if (values[index] == NULL || lengths[index] != 0) {
+            continue;
+        }
+        if (!statement_parameter_is_datetime(statement, index)) {
+            continue;
+        }
+        (void)row_index;  /* candidacy was resolved per row before conversion */
+        free((void *)values[index]);
+        values[index] = NULL;   /* NULL value pointer => SQL NULL to libpq */
+        lengths[index] = 0;
+    }
+}
+
+/*
+ * Populate parameter_type_oids for a statement about to be directly executed
+ * (SQLExecDirect), which otherwise leaves parameter types for the server to
+ * infer and never learns them. CvtNullDate needs those types to recognize a
+ * date/timestamp parameter. We issue a Parse/Describe against the unnamed
+ * prepared statement purely to read back the inferred parameter OIDs; the
+ * subsequent PQexecParams re-parses the query independently. Failures are
+ * ignored — the substitution simply will not trigger.
+ */
+static void statement_describe_param_types_for_direct(OdbcStatement *statement)
+{
+    PGconn *libpq_connection = statement->parent_connection->libpq_connection;
+
+    PGresult *prepare_result = PQprepare(libpq_connection, "",
+                                         statement->translated_sql, 0, NULL);
+    bool prepared_ok = prepare_result &&
+                       PQresultStatus(prepare_result) == PGRES_COMMAND_OK;
+    if (prepare_result) {
+        PQclear(prepare_result);
+    }
+    if (!prepared_ok) {
+        return;
+    }
+
+    PGresult *describe_result = PQdescribePrepared(libpq_connection, "");
+    if (describe_result) {
+        if (PQresultStatus(describe_result) == PGRES_COMMAND_OK) {
+            statement_capture_parameter_types(statement, describe_result);
+        }
+        PQclear(describe_result);
+    }
+}
+
+/*
  * True if any bound parameter marker of this statement targets a large object.
  * Cheap guard so the ordinary execute path pays nothing when no "lo" parameter
  * is involved (the common case).
@@ -1548,6 +1689,14 @@ SQLRETURN statement_execute(OdbcStatement *statement)
         int effective_param_count = param_count;
         if (effective_param_count > statement->detected_param_count) {
             effective_param_count = statement->detected_param_count;
+        }
+
+        /* CvtNullDate: rewrite an empty string bound to a date/timestamp column
+         * to SQL NULL. The prepared path already captured parameter types at
+         * describe time, so no extra round-trip is needed here. */
+        if (statement_has_cvt_null_date_candidate(statement, 0)) {
+            statement_apply_cvt_null_date(statement, param_values, param_lengths,
+                                          effective_param_count, 0);
         }
 
         /* Inline large-object parameters: replace each "lo"-typed parameter's
@@ -3134,6 +3283,16 @@ SQLRETURN statement_exec_direct(OdbcStatement *statement,
         int effective_param_count = param_count;
         if (effective_param_count > statement->detected_param_count) {
             effective_param_count = statement->detected_param_count;
+        }
+
+        /* CvtNullDate: an empty string bound to a date/timestamp column must be
+         * sent as SQL NULL (PostgreSQL rejects "" as a date). Direct execution
+         * otherwise never learns the parameter types, so describe them first,
+         * but only when there is actually an empty-string candidate to rewrite. */
+        if (statement_has_cvt_null_date_candidate(statement, 0)) {
+            statement_describe_param_types_for_direct(statement);
+            statement_apply_cvt_null_date(statement, param_values, param_lengths,
+                                          effective_param_count, 0);
         }
 
         result = PQexecParams(libpq_connection,

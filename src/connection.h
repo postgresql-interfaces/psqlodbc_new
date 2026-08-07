@@ -108,7 +108,34 @@ typedef struct ConnectionInfo {
      * server-appropriate default (statement-level rollback on modern servers).
      * Matches the original psqlodbc's rollback_on_error option. */
     int rollback_on_error;
+
+    /* When true, string column values delivered to SQL_C_CHAR / SQL_C_WCHAR have
+     * every bare line feed ('\n') expanded to a carriage-return/line-feed pair
+     * ("\r\n"). The reported (indicator) length counts the EXPANDED bytes. Some
+     * Windows applications require CR+LF line endings in fetched text. Controlled
+     * by the "LFConversion" keyword (and packed into the "CX" bitfield, bit
+     * CONNECTION_LF_CONVERSION_BIT). Matches the original psqlodbc's
+     * lf_conversion option. */
+    bool lf_conversion;
+
+    /* When true, an empty bound character string ("") targeting a date/time
+     * column is sent to PostgreSQL as SQL NULL instead of the empty literal
+     * (which PostgreSQL rejects as "invalid input syntax for type date").
+     * Some applications (historically FoxPro) represent a null date this way.
+     * Controlled by bit CONNECTION_CVT_NULL_DATE_BIT of the "AB" (extra options)
+     * bitfield. Matches the original psqlodbc's cvt_null_date_string option. */
+    bool cvt_null_date;
 } ConnectionInfo;
+
+/* Bit within the packed "CX" connection-string bitfield that enables
+ * LFConversion (see ConnectionInfo.lf_conversion). Matches the original
+ * psqlodbc's BIT_LFCONVERSION. */
+#define CONNECTION_LF_CONVERSION_BIT 0x01L
+
+/* Bit within the "AB" (extra options) connection-string bitfield that enables
+ * CvtNullDate (see ConnectionInfo.cvt_null_date). Matches the original
+ * psqlodbc's BIT_CVT_NULL_DATE (1 << 3). */
+#define CONNECTION_CVT_NULL_DATE_BIT 0x08L
 
 /* Values for ConnectionInfo.rollback_on_error, matching the original psqlodbc.
  *   NOTHING:   leave the aborted transaction as-is; the application must issue

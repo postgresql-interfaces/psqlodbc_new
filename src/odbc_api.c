@@ -2872,6 +2872,22 @@ SQLSetStmtAttr(SQLHSTMT   statement_handle,
         statement->param_bind_type = value_as_ulen;
         return SQL_SUCCESS;
 
+    case SQL_ATTR_ASYNC_ENABLE:
+        /* This driver executes every statement synchronously. Asking to turn
+         * async ON is a request we cannot honor, so it is an error; turning it
+         * OFF is a no-op that matches our actual behavior and must succeed. This
+         * mirrors the reference driver (options.c), which rejects ON and treats
+         * OFF as a no-op. There is no state to store: SQLGetStmtAttr always
+         * reports OFF. */
+        if ((SQLULEN)(uintptr_t)value_ptr == SQL_ASYNC_ENABLE_ON) {
+            diagnostics_add_record(&statement->diagnostics,
+                                   "HYC00",  /* Optional feature not implemented */
+                                   0,
+                                   "Asynchronous statement execution is not supported.");
+            return SQL_ERROR;
+        }
+        return SQL_SUCCESS;
+
     default:
         diagnostics_add_record(&statement->diagnostics,
                                "HY092",  /* Invalid attribute/option identifier */
@@ -2939,6 +2955,19 @@ SQLGetStmtAttr(SQLHSTMT    statement_handle,
         }
         if (string_length_ptr) {
             *string_length_ptr = (SQLINTEGER)sizeof(SQLULEN);
+        }
+        return SQL_SUCCESS;
+
+    case SQL_ATTR_ASYNC_ENABLE:
+        /* Always OFF: this driver has no asynchronous execution mode. Written as
+         * a 4-byte SQLINTEGER because applications (and the reference driver in
+         * pgapi30.c) size this buffer as SQLINTEGER/SQL_IS_UINTEGER; a 64-bit
+         * write would overrun the caller's 4-byte buffer. */
+        if (value_ptr) {
+            *(SQLINTEGER *)value_ptr = SQL_ASYNC_ENABLE_OFF;
+        }
+        if (string_length_ptr) {
+            *string_length_ptr = (SQLINTEGER)sizeof(SQLINTEGER);
         }
         return SQL_SUCCESS;
 

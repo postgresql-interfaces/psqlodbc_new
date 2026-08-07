@@ -46,7 +46,108 @@ static char *duplicate_string(const char *source)
 #define UTF16_HIGH_SURROGATE_MIN 0xD800
 #define UTF16_HIGH_SURROGATE_MAX 0xDBFF
 
+/* Carriage return byte, prepended to each bare line feed when LFConversion
+ * expands "\n" to "\r\n" on string output. */
+#define CARRIAGE_RETURN_BYTE '\r'
+
 /* ---- Internal Helpers ---- */
+
+/*
+ * Expand every bare line feed ('\n') in a byte string to a carriage-return /
+ * line-feed pair ("\r\n"), returning a freshly allocated NUL-terminated copy
+ * and writing its length (excluding the terminator) to *expanded_length.
+ *
+ * A line feed already preceded by a carriage return is left alone (only the
+ * missing CR is what we add), matching the original psqlodbc convert_linefeeds.
+ * Because CR and LF are single ASCII bytes that never appear as a continuation
+ * byte of a multi-byte UTF-8 sequence, operating on the raw bytes is safe for
+ * UTF-8 text and yields the correct result after later UTF-16 conversion.
+ *
+ * Returns NULL on allocation failure (the caller treats that as SQL_ERROR).
+ */
+static char *expand_line_feeds(const char *source, int source_length,
+                               int *expanded_length)
+{
+    /* Worst case doubles every byte (a string of nothing but line feeds). */
+    char *expanded = malloc((size_t)source_length * 2 + 1);
+    if (!expanded) {
+        return NULL;
+    }
+    int out_index = 0;
+    for (int i = 0; i < source_length; i++) {
+        char current = source[i];
+        if (current == '\n' &&
+            !(i > 0 && source[i - 1] == CARRIAGE_RETURN_BYTE)) {
+            expanded[out_index++] = CARRIAGE_RETURN_BYTE;
+        }
+        expanded[out_index++] = current;
+    }
+    expanded[out_index] = '\0';
+    *expanded_length = out_index;
+    return expanded;
+}
+
+/*
+ * Return true when this statement's connection has LFConversion enabled, so a
+ * text value being delivered to SQL_C_CHAR / SQL_C_WCHAR should have its line
+ * feeds expanded to CR+LF (see ConnectionInfo.lf_conversion).
+ */
+static bool statement_wants_line_feed_conversion(const OdbcStatement *statement)
+{
+    return statement->parent_connection != NULL &&
+           statement->parent_connection->info.lf_conversion;
+}
+
+/*
+ * Under CvtNullDate, a NULL value in a date/timestamp column is delivered to a
+ * character/date target as an EMPTY STRING (indicator 0) rather than as
+ * SQL_NULL_DATA — the symmetric read side of the empty-string-to-NULL parameter
+ * rewrite, matching the original psqlodbc. Returns true when this NULL should be
+ * rendered that way for the given source column type and requested C type.
+ */
+static bool statement_null_date_reads_as_empty(const OdbcStatement *statement,
+                                               unsigned int column_oid,
+                                               SQLSMALLINT target_type)
+{
+    if (!statement->parent_connection ||
+        !statement->parent_connection->info.cvt_null_date) {
+        return false;
+    }
+    if (column_oid != PG_TYPE_DATE &&
+        column_oid != PG_TYPE_TIMESTAMP &&
+        column_oid != PG_TYPE_TIMESTAMPTZ) {
+        return false;
+    }
+    return target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR ||
+           target_type == SQL_C_DATE || target_type == SQL_C_TYPE_DATE ||
+           target_type == SQL_C_DEFAULT;
+}
+
+/*
+ * Write the CvtNullDate empty-string result for a NULL date/timestamp column
+ * into target_value (a zero-length string) and set *indicator to 0. For a
+ * character target that is a NUL terminator; for SQL_C_WCHAR a wide NUL. Sets
+ * the indicator even when there is no buffer (length-query call). Returns
+ * SQL_SUCCESS.
+ */
+static SQLRETURN write_null_date_empty_string(SQLSMALLINT target_type,
+                                              SQLPOINTER target_value,
+                                              SQLLEN buffer_length,
+                                              SQLLEN *indicator)
+{
+    if (indicator) {
+        *indicator = 0;
+    }
+    if (target_value && buffer_length > 0) {
+        if (target_type == SQL_C_WCHAR &&
+            buffer_length >= (SQLLEN)sizeof(SQLWCHAR)) {
+            ((SQLWCHAR *)target_value)[0] = 0;
+        } else {
+            ((char *)target_value)[0] = '\0';
+        }
+    }
+    return SQL_SUCCESS;
+}
 
 /* Lowercase a single ASCII byte. Interval unit keywords from PostgreSQL are
  * pure ASCII, so locale-independent byte lowercasing is correct here. */
@@ -572,6 +673,29 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
             }
         }
 
+        /* LFConversion: expand bare "\n" to "\r\n". The reported length and any
+         * truncation must reflect the EXPANDED bytes, so this happens before the
+         * length is computed. bytea hex never contains line feeds, so restricting
+         * this to non-bytea values also avoids a pointless allocation. The
+         * expanded buffer reuses the bytea_hex ownership slot so the existing
+         * free(bytea_hex) paths release it. */
+        if (postgres_oid != PG_TYPE_BYTEA &&
+            statement_wants_line_feed_conversion(statement)) {
+            int expanded_length = 0;
+            char *expanded = expand_line_feeds(char_value, char_length,
+                                               &expanded_length);
+            if (!expanded) {
+                free(bytea_hex);
+                diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                       "Out of memory expanding line feeds for SQL_C_CHAR.");
+                return SQL_ERROR;
+            }
+            free(bytea_hex);
+            bytea_hex = expanded;
+            char_value = expanded;
+            char_length = expanded_length;
+        }
+
         SQLLEN actual_length = (SQLLEN)char_length;
 
         if (indicator_or_length) {
@@ -765,6 +889,28 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
                 wchar_source = bytea_wchar_hex;
                 wchar_source_length = (int)(byte_count * 2);
             }
+        }
+
+        /* LFConversion: expand bare "\n" to "\r\n" on the UTF-8 source before it
+         * is transcoded, so the reported byte length and any truncation reflect
+         * the expanded text. bytea hex has no line feeds, so skip it. The
+         * expanded buffer reuses the bytea_wchar_hex ownership slot, which is
+         * freed just below after the UTF-16 conversion. */
+        if (postgres_oid != PG_TYPE_BYTEA &&
+            statement_wants_line_feed_conversion(statement)) {
+            int expanded_length = 0;
+            char *expanded = expand_line_feeds(wchar_source, wchar_source_length,
+                                               &expanded_length);
+            if (!expanded) {
+                free(bytea_wchar_hex);
+                diagnostics_add_record(&statement->diagnostics, "HY001", 0,
+                                       "Out of memory expanding line feeds for SQL_C_WCHAR.");
+                return SQL_ERROR;
+            }
+            free(bytea_wchar_hex);
+            bytea_wchar_hex = expanded;
+            wchar_source = expanded;
+            wchar_source_length = expanded_length;
         }
 
         /* Convert the source UTF-8 text (PostgreSQL client encoding) to a
@@ -1160,7 +1306,16 @@ static SQLRETURN populate_bound_columns_row(OdbcStatement *statement,
 
         /* Handle NULL values: set indicator and skip buffer write */
         if (value_is_null) {
-            if (element_indicator) {
+            /* CvtNullDate: a NULL date/timestamp bound as char/date is delivered
+             * as an empty string (indicator 0), not SQL_NULL_DATA. */
+            unsigned int null_col_oid =
+                (unsigned int)PQftype(statement->current_result, column_index);
+            if (statement_null_date_reads_as_empty(statement, null_col_oid,
+                                                    resolved_type)) {
+                write_null_date_empty_string(resolved_type, element_buffer,
+                                             binding->buffer_length,
+                                             element_indicator);
+            } else if (element_indicator) {
                 *element_indicator = SQL_NULL_DATA;
             }
             continue;
@@ -2034,6 +2189,14 @@ SQLRETURN results_get_data(OdbcStatement *statement,
 
     /* Check for NULL */
     if (value_is_null) {
+        /* CvtNullDate: a NULL date/timestamp read into a char/date target comes
+         * back as an empty string (indicator 0), not SQL_NULL_DATA. */
+        unsigned int null_col_oid =
+            (unsigned int)PQftype(statement->current_result, column_index);
+        if (statement_null_date_reads_as_empty(statement, null_col_oid, target_type)) {
+            return write_null_date_empty_string(target_type, target_value,
+                                                buffer_length, indicator_or_length);
+        }
         if (indicator_or_length) {
             *indicator_or_length = SQL_NULL_DATA;
         } else {

@@ -113,6 +113,48 @@ EOF
 export ODBCSYSINI="$WORK_DIR"
 export ODBCINI="$WORK_DIR/odbc.ini"
 
+# Detect the server's major version.
+#
+# Some tests behave differently across PostgreSQL releases and therefore have
+# more than one acceptable output. Upstream psqlodbc encodes this by keeping a
+# version-specific expected file under test/expected/v<major>/<test>.out that
+# takes precedence over the generic test/expected/<test>.out, and its rewritten
+# runsuite.c selects the version directory from the connected server's version
+# (commit "fix tests for version 19"). We mirror that here.
+#
+# The concrete case that requires this: PostgreSQL 19 removed support for
+# "SET standard_conforming_strings=off" (the server now raises
+# "non-standard string literals are not supported"). The quotes and
+# error-rollback tests skip their scs=off blocks on servers >= 19, so their
+# output no longer matches the generic expected file — it matches the v19 one.
+SERVER_MAJOR_VERSION=$(psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" \
+    -tAc "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null | tr -d '[:space:]')
+
+# Pick the applicable version-specific expected directory.
+#
+# Upstream keeps a single "vN" directory (currently v19) whose contents apply to
+# servers of that version AND LATER: v19 was introduced for the PG19 behavior
+# change and remains correct for v20, v21, ... until a newer directory
+# supersedes it. So the rule is "highest vN with N <= server major version",
+# not an exact "v<major>" match — otherwise a PG20 server would find no v20
+# directory and wrongly fall back to the pre-19 generic expected files.
+EXPECTED_VERSION_DIR=""
+if [ -n "$SERVER_MAJOR_VERSION" ]; then
+    best_version=0
+    for version_dir in "$ORIG_TEST_DIR"/expected/v[0-9]*; do
+        [ -d "$version_dir" ] || continue
+        dir_version="${version_dir##*/v}"
+        case "$dir_version" in
+            ''|*[!0-9]*) continue ;;   # skip non-numeric suffixes
+        esac
+        if [ "$dir_version" -le "$SERVER_MAJOR_VERSION" ] && \
+           [ "$dir_version" -gt "$best_version" ]; then
+            best_version="$dir_version"
+            EXPECTED_VERSION_DIR="$version_dir"
+        fi
+    done
+fi
+
 # Determine compiler flags
 ODBC_CFLAGS=$(pkg-config --cflags odbc 2>/dev/null || echo "-I/usr/include")
 ODBC_LIBS=$(pkg-config --libs odbc 2>/dev/null || echo "-lodbc")
@@ -223,15 +265,32 @@ for test_name in $TESTS; do
     # "<test>_1.out", "<test>_2.out", ... (e.g. wchar-char differs per client
     # locale/encoding). A run passes if it matches ANY of these, mirroring the
     # original runsuite's rundiff() behavior.
+    #
+    # A version-specific expected file (expected/v<N>/<test>.out) takes
+    # precedence when present, so newer servers whose behavior diverged (e.g.
+    # PG19 dropping standard_conforming_strings=off) are compared against the
+    # right baseline. It is tried first; the generic file remains the fallback.
+    version_expected_file=""
+    if [ -n "$EXPECTED_VERSION_DIR" ] && \
+       [ -f "$EXPECTED_VERSION_DIR/${test_name}.out" ]; then
+        version_expected_file="$EXPECTED_VERSION_DIR/${test_name}.out"
+    fi
+
     expected_file="$ORIG_TEST_DIR/expected/${test_name}.out"
-    if [ ! -f "$expected_file" ]; then
+    if [ ! -f "$expected_file" ] && [ -z "$version_expected_file" ]; then
         echo "PASS: $test_name (no expected file to compare)"
         PASS=$((PASS + 1))
         continue
     fi
+    # For diagnostics on failure, prefer showing a diff against the file the run
+    # was actually expected to match.
+    diff_reference="${version_expected_file:-$expected_file}"
 
     matched=""
-    for candidate in "$expected_file" "$ORIG_TEST_DIR/expected/${test_name}"_*.out; do
+    for candidate in "$version_expected_file" \
+                     "$expected_file" \
+                     "$ORIG_TEST_DIR/expected/${test_name}"_*.out; do
+        [ -n "$candidate" ] || continue
         [ -f "$candidate" ] || continue
         # --strip-trailing-cr matches the original psqlodbc runsuite's diff
         # invocation: some checked-in expected files carry stray CRLF line
@@ -247,7 +306,7 @@ for test_name in $TESTS; do
         PASS=$((PASS + 1))
     else
         echo "FAIL: $test_name (output differs)"
-        diff -u "$expected_file" "$result_file" | head -20
+        diff -u "$diff_reference" "$result_file" | head -20
         echo "      ..."
         FAIL=$((FAIL + 1))
     fi

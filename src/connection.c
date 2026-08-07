@@ -440,6 +440,11 @@ void connection_info_clear(ConnectionInfo *info)
     /* No explicit error-rollback mode until the connection string sets one via
      * "Protocol=7.4-N"; the driver then falls back to its server-based default. */
     info->rollback_on_error = ROLLBACK_ON_ERROR_UNSPECIFIED;
+
+    /* Both text-handling quirks are off unless explicitly requested via the
+     * connection string, matching the original psqlodbc defaults. */
+    info->lf_conversion = false;
+    info->cvt_null_date = false;
 }
 
 bool connection_add_statement(OdbcConnection *connection,

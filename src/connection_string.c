@@ -144,6 +144,37 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
             info->rollback_on_error = (int)strtol(dash + 1, NULL, 10);
         }
 
+    } else if (case_insensitive_compare(key, "LFConversion") == 0) {
+        /* Explicit keyword form: any non-zero integer enables LF -> CR+LF
+         * expansion on string output (see ConnectionInfo.lf_conversion). */
+        char lf_buffer[16];
+        safe_copy_to_buffer(lf_buffer, sizeof(lf_buffer), value, value_length);
+        info->lf_conversion = (strtol(lf_buffer, NULL, 10) != 0);
+
+    } else if (case_insensitive_compare(key, "CX") == 0) {
+        /* The abbreviated "CX" attribute packs several common driver options
+         * into one hex bitfield. The original driver optionally prefixes the
+         * value with a two-hex-digit count when the string is >= 2 characters;
+         * the flag bits always follow that prefix. We only consume the
+         * LFConversion bit here. */
+        char cx_buffer[32];
+        safe_copy_to_buffer(cx_buffer, sizeof(cx_buffer), value, value_length);
+        const char *flag_text = cx_buffer;
+        if (strlen(cx_buffer) >= 2) {
+            flag_text = cx_buffer + 2;   /* skip the leading count field */
+        }
+        long cx_flags = strtol(flag_text, NULL, 16);
+        info->lf_conversion = ((cx_flags & CONNECTION_LF_CONVERSION_BIT) != 0);
+
+    } else if (case_insensitive_compare(key, "AB") == 0) {
+        /* The "AB" (extra options) attribute is a hex bitfield of assorted
+         * driver quirks. We consume the CvtNullDate bit (empty string -> NULL
+         * for date/time parameters); other bits are not implemented. */
+        char ab_buffer[32];
+        safe_copy_to_buffer(ab_buffer, sizeof(ab_buffer), value, value_length);
+        long ab_flags = strtol(ab_buffer, NULL, 16);
+        info->cvt_null_date = ((ab_flags & CONNECTION_CVT_NULL_DATE_BIT) != 0);
+
     } else if (case_insensitive_compare(key, "DisallowPremature") == 0) {
         /* Accepted for compatibility with the original driver; the modern
          * implementation always describes results after execution, so there is
