@@ -100,10 +100,15 @@ static bool statement_wants_line_feed_conversion(const OdbcStatement *statement)
 
 /*
  * Under CvtNullDate, a NULL value in a date/timestamp column is delivered to a
- * character/date target as an EMPTY STRING (indicator 0) rather than as
+ * character target as an EMPTY STRING (indicator 0) rather than as
  * SQL_NULL_DATA — the symmetric read side of the empty-string-to-NULL parameter
  * rewrite, matching the original psqlodbc. Returns true when this NULL should be
  * rendered that way for the given source column type and requested C type.
+ *
+ * Only SQL_C_CHAR and SQL_C_WCHAR targets are eligible: the empty-string result
+ * is a variable-length string value, which has no meaningful representation in a
+ * fixed-width DATE_STRUCT. A date C-type (SQL_C_DATE / SQL_C_TYPE_DATE) or the
+ * default C type therefore falls through to normal SQL_NULL_DATA handling.
  */
 static bool statement_null_date_reads_as_empty(const OdbcStatement *statement,
                                                unsigned int column_oid,
@@ -118,9 +123,7 @@ static bool statement_null_date_reads_as_empty(const OdbcStatement *statement,
         column_oid != PG_TYPE_TIMESTAMPTZ) {
         return false;
     }
-    return target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR ||
-           target_type == SQL_C_DATE || target_type == SQL_C_TYPE_DATE ||
-           target_type == SQL_C_DEFAULT;
+    return target_type == SQL_C_CHAR || target_type == SQL_C_WCHAR;
 }
 
 /*

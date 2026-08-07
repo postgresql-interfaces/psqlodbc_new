@@ -2449,8 +2449,30 @@ static PGresult *execute_one_fragment(OdbcStatement *statement,
         free(param_lengths);
         free(param_formats);
     } else {
-        /* No parameters for this fragment — a plain command. */
-        result = PQexec(libpq_connection, analysis.transformed_sql);
+        /* No parameters for this fragment — a plain command.
+         *
+         * Use the asynchronous send/get pair rather than PQexec. When a command
+         * causes the backend to terminate (e.g. pg_terminate_backend on its own
+         * PID), PQexec collapses the failure into a generic "server closed the
+         * connection unexpectedly" result with a NULL SQLSTATE, discarding the
+         * real FATAL error the server sent first. PQsendQuery + PQgetResult
+         * preserves that first result with its true SQLSTATE (e.g. 57P01) and
+         * severity, which the ODBC diagnostics must report. We return the first
+         * result and drain any remaining ones for this single command. */
+        if (PQsendQuery(libpq_connection, analysis.transformed_sql)) {
+            result = PQgetResult(libpq_connection);
+            PGresult *extra_result;
+            while ((extra_result = PQgetResult(libpq_connection)) != NULL) {
+                /* A single command yields one result of interest; discard any
+                 * trailing results (and the terminating NULL) so the connection
+                 * is ready for the next fragment. */
+                PQclear(extra_result);
+            }
+        } else {
+            /* The send itself failed (e.g. connection already dead); fall back
+             * so the caller still gets a result object to inspect. */
+            result = PQexec(libpq_connection, analysis.transformed_sql);
+        }
     }
 
     free(analysis.transformed_sql);
@@ -2512,9 +2534,20 @@ static SQLRETURN execute_multi_statement(OdbcStatement *statement)
             /* Stop at the first failing fragment, mirroring how PQexec aborts a
              * multi-command string on the first error. */
             diagnostics_clear(&statement->diagnostics);
+
+            /* If the command killed the backend, the connection is now dead.
+             * The original driver reports that with the context "The connection
+             * has been lost"; the still-structured server error (e.g. 57P01)
+             * remains the primary message. Otherwise use the normal execution
+             * context. */
+            const char *failure_context = "Error while executing the query";
+            if (statement->parent_connection &&
+                PQstatus(statement->parent_connection->libpq_connection) == CONNECTION_BAD) {
+                failure_context = "The connection has been lost";
+            }
             error_add_diagnostic_from_result_ctx(&statement->diagnostics, result,
                                                  "HY000",
-                                                 "Error while executing the query");
+                                                 failure_context);
             if (statement->parent_connection &&
                 statement->parent_connection->transaction_state == TRANSACTION_STATE_ACTIVE) {
                 statement->parent_connection->transaction_state = TRANSACTION_STATE_FAILED;

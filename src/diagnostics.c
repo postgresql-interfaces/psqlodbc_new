@@ -28,6 +28,10 @@ void diagnostics_clear(DiagnosticRecords *records)
     }
 
     records->record_count = 0;
+
+    /* Forget any message-paging chunk size negotiated with a previous caller;
+     * the next error's paging is renegotiated from that caller's buffer. */
+    records->paging_chunk_size = 0;
 }
 
 bool diagnostics_add_record(DiagnosticRecords *records,

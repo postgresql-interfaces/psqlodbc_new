@@ -692,31 +692,126 @@ SQLGetDiagRec(SQLSMALLINT  handle_type,
         return SQL_INVALID_HANDLE;
     }
 
+    /*
+     * Long-message paging.
+     *
+     * The ODBC driver manager silently caps the message buffer an application
+     * passes to SQLGetDiagRec (historically to around 511 bytes). Real
+     * applications — and the psqlodbc regression harness — cope with this by
+     * calling SQLGetDiagRec repeatedly with an incrementing RecNumber and
+     * concatenating the pieces until the call returns SQL_NO_DATA. A single
+     * long diagnostic message (e.g. a syntax error quoting a huge statement)
+     * is therefore delivered as several successive "records", each holding one
+     * fixed-size chunk of the same underlying message.
+     *
+     * We reproduce that behavior: the linear RecNumber sequence walks the
+     * stored records, and any record whose message is longer than the chunk
+     * size is split into consecutive chunks that occupy consecutive RecNumbers.
+     * Records shorter than the chunk (the common case, including collected
+     * NOTICE messages) occupy exactly one RecNumber each, so multi-record
+     * handles behave exactly as before.
+     *
+     * The computation is a pure function of RecNumber and the stored records
+     * (only the chunk size is remembered on the handle), so repeated calls are
+     * idempotent — the ODBC spec requires SQLGetDiagRec not to alter
+     * diagnostic state, and the regression test checks this explicitly.
+     */
+    int chunk_size = diagnostics->paging_chunk_size;
+    if (chunk_size == 0 || record_number == 1) {
+        /*
+         * Reserve one byte for the null terminator, matching how the driver
+         * manager sizes each retrievable chunk. A buffer_length of exactly 1
+         * leaves no room for message text (only the terminator), so it cannot
+         * yield a usable chunk size — treat it like the zero/negative-buffer
+         * case and fall back to the default page size. This also keeps
+         * chunk_size >= 1, which the ceil-division below relies on to avoid a
+         * divide-by-zero. */
+        if (buffer_length > 1) {
+            chunk_size = buffer_length - 1;
+        } else if (chunk_size == 0) {
+            chunk_size = DIAGNOSTIC_DEFAULT_PAGE_SIZE;
+        }
+        diagnostics->paging_chunk_size = chunk_size;
+    }
+
+    /* Walk the stored records, treating each as one-or-more chunks, until the
+     * linear RecNumber lands inside a specific record at a specific chunk. */
     char state_buffer[SQLSTATE_LENGTH + 1];
     int error_code = 0;
-    const char *message = NULL;
+    const char *full_message = NULL;
+    int chunk_within_record = -1;
+    int record_index = 1;               /* 1-based record we are examining */
+    int remaining_position = record_number;
 
-    if (!diagnostics_get_record(diagnostics, record_number, state_buffer, &error_code, &message)) {
+    while (diagnostics_get_record(diagnostics, record_index,
+                                  state_buffer, &error_code, &full_message)) {
+        size_t message_length = full_message ? strlen(full_message) : 0;
+
+        /* An empty message still occupies exactly one chunk so that the record
+         * is reportable. A longer message spans ceil(length / chunk_size)
+         * chunks. */
+        int chunk_count = 1;
+        if (message_length > 0) {
+            chunk_count = (int)((message_length + (size_t)chunk_size - 1) / (size_t)chunk_size);
+        }
+
+        if (remaining_position <= chunk_count) {
+            chunk_within_record = remaining_position - 1;
+            break;
+        }
+
+        remaining_position -= chunk_count;
+        record_index++;
+    }
+
+    /* RecNumber ran past the last chunk of the last record. */
+    if (chunk_within_record < 0) {
         return SQL_NO_DATA;
     }
 
-    /* Copy SQLSTATE to caller's buffer */
+    /* Copy SQLSTATE and native error code (these describe the record, and are
+     * identical for every chunk of the same record). */
     if (sql_state) {
         memcpy(sql_state, state_buffer, SQLSTATE_LENGTH);
         sql_state[SQLSTATE_LENGTH] = '\0';
     }
-
-    /* Copy native error code */
     if (native_error) {
         *native_error = (SQLINTEGER)error_code;
     }
 
-    /* Copy message text with truncation handling */
-    SQLSMALLINT actual_length = copy_string_to_output(
-        message, message_text, buffer_length, text_length);
+    /* Slice out the requested chunk of this record's message. */
+    size_t message_length = full_message ? strlen(full_message) : 0;
+    size_t chunk_offset = (size_t)chunk_within_record * (size_t)chunk_size;
+    size_t chunk_length = 0;
+    if (chunk_offset < message_length) {
+        chunk_length = message_length - chunk_offset;
+        if (chunk_length > (size_t)chunk_size) {
+            chunk_length = (size_t)chunk_size;
+        }
+    }
 
-    /* If message was truncated, return SQL_SUCCESS_WITH_INFO */
-    if (message_text && buffer_length > 0 && message && actual_length >= buffer_length) {
+    /* Report the full length of this chunk so the caller can detect truncation
+     * that happens WITHIN a chunk (buffer smaller than the negotiated chunk). */
+    if (text_length) {
+        *text_length = (SQLSMALLINT)chunk_length;
+    }
+
+    size_t bytes_written = 0;
+    if (message_text && buffer_length > 0) {
+        bytes_written = chunk_length;
+        if (bytes_written > (size_t)(buffer_length - 1)) {
+            bytes_written = (size_t)(buffer_length - 1);
+        }
+        if (full_message && bytes_written > 0) {
+            memcpy(message_text, full_message + chunk_offset, bytes_written);
+        }
+        message_text[bytes_written] = '\0';
+    }
+
+    /* SQL_SUCCESS_WITH_INFO only signals truncation WITHIN this chunk. Having
+     * further chunks (further RecNumbers) is NOT truncation — the harness loop
+     * relies on full chunks returning SQL_SUCCESS so it keeps iterating. */
+    if (bytes_written < chunk_length) {
         return SQL_SUCCESS_WITH_INFO;
     }
 

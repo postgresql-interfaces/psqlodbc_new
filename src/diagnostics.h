@@ -25,6 +25,12 @@
  * terminator. This constant avoids magic '6' appearing in struct definitions. */
 #define SQLSTATE_LENGTH 5
 
+/* Default chunk size for paging a long diagnostic message across successive
+ * SQLGetDiagRec calls when the caller passes a zero-length buffer (so no chunk
+ * size can be inferred). This mirrors the historical ODBC driver-manager
+ * message-buffer cap used by the original psqlodbc driver (DRVMNGRDIV). */
+#define DIAGNOSTIC_DEFAULT_PAGE_SIZE 511
+
 /* A single diagnostic record as defined by the ODBC specification.
  * message_text is heap-allocated and owned by this record. */
 typedef struct DiagnosticRecord {
@@ -38,6 +44,15 @@ typedef struct DiagnosticRecord {
 typedef struct DiagnosticRecords {
     DiagnosticRecord records[MAX_DIAGNOSTIC_RECORDS];
     int record_count;
+
+    /*
+     * Chunk size (in characters) used when a single long diagnostic message is
+     * returned to the application in pieces across successive SQLGetDiagRec
+     * RecNumber calls. See the paging discussion in SQLGetDiagRec (odbc_api.c).
+     * Captured from the caller's buffer length on the first retrieval; 0 means
+     * "not yet established". Reset by diagnostics_clear.
+     */
+    int paging_chunk_size;
 } DiagnosticRecords;
 
 /*
