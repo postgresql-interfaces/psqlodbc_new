@@ -34,8 +34,15 @@
 #define PG_TYPE_INT4          23
 #define PG_TYPE_TEXT          25
 #define PG_TYPE_OID           26
+#define PG_TYPE_XML          142
+#define PG_TYPE_XMLARRAY     143
 #define PG_TYPE_FLOAT4       700
 #define PG_TYPE_FLOAT8       701
+#define PG_TYPE_UNKNOWN      705   /* literal of not-yet-resolved type */
+#define PG_TYPE_MONEY        790
+#define PG_TYPE_TEXTARRAY   1009
+#define PG_TYPE_BPCHARARRAY 1014
+#define PG_TYPE_VARCHARARRAY 1015
 #define PG_TYPE_BPCHAR      1042   /* blank-padded character(n) */
 #define PG_TYPE_VARCHAR     1043
 #define PG_TYPE_DATE        1082

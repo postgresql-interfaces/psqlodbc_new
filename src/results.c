@@ -262,6 +262,178 @@ static size_t decode_bytea_text(const char *text, size_t text_length,
     return out_index;
 }
 
+/*
+ * True when a PostgreSQL column type is a genuine date/time/timestamp type.
+ *
+ * Only these types carry parseable date/time components. The original driver's
+ * copy_and_convert_field only populates its SIMPLE_TIME from the value for these
+ * field types; for every other type (macaddr, inet, text, ...) the time struct
+ * stays zeroed. We reproduce that gating so, e.g., casting a macaddr like
+ * "08:00:2b:..." to SQL_C_TYPE_TIME yields 00:00:00 rather than accidentally
+ * parsing "08" as an hour.
+ */
+static bool field_type_is_datetime(unsigned int postgres_oid)
+{
+    return postgres_oid == PG_TYPE_DATE ||
+           postgres_oid == PG_TYPE_TIME ||
+           postgres_oid == PG_TYPE_TIMESTAMP ||
+           postgres_oid == PG_TYPE_TIMESTAMPTZ;
+}
+
+/*
+ * Given the text of a timestamptz value, return the length up to (but not
+ * including) any trailing timezone offset.
+ *
+ * PostgreSQL renders timestamptz with a trailing numeric zone, e.g.
+ * "2011-02-16 06:49:18-08" or "...+05:30". When such a value is delivered as a
+ * character string the original driver reformats it from its parsed components
+ * WITHOUT the zone, so the visible text has no offset. We reproduce that by
+ * trimming from the sign that introduces the zone. The date portion also
+ * contains '-' characters, so we only start looking after the space that
+ * separates the date from the time.
+ */
+static int timestamptz_text_length_without_zone(const char *text, int length)
+{
+    int time_start = 0;
+    for (int index = 0; index < length; index++) {
+        if (text[index] == ' ') {
+            time_start = index + 1;
+            break;
+        }
+    }
+    for (int index = time_start; index < length; index++) {
+        if (text[index] == '+' || text[index] == '-') {
+            return index;
+        }
+    }
+    return length;
+}
+
+/*
+ * Strip currency formatting from a PostgreSQL money value so it can be parsed
+ * as a plain number. This is a modern port of the original driver's
+ * convert_money().
+ *
+ * PostgreSQL formats money with a currency symbol and thousands/decimal
+ * separators whose roles depend on locale (e.g. "$1,234.56", "1.234,56 kr").
+ * We first decide which of '.' or ',' is the decimal separator: whichever
+ * appears last and within two characters of the final digit is the decimal
+ * point; the other is a thousands separator to be dropped. We then emit only
+ * the sign, the digits, and a single '.' decimal point into out_buffer.
+ *
+ * Returns false only when out_buffer is too small to hold the result.
+ */
+static bool convert_money_to_plain_number(const char *input,
+                                          char *out_buffer,
+                                          size_t out_buffer_size)
+{
+    int last_digit_index = -1;
+    int first_period_index = -1;
+    int first_comma_index = -1;
+    for (int index = 0; input[index] != '\0'; index++) {
+        char character = input[index];
+        if (character == '.') {
+            if (first_period_index < 0) {
+                first_period_index = index;
+            }
+        } else if (character == ',') {
+            if (first_comma_index < 0) {
+                first_comma_index = index;
+            }
+        } else if (character >= '0' && character <= '9') {
+            last_digit_index = index;
+        }
+    }
+
+    /* Decide which separator is the decimal point: the later one, provided it
+     * sits within the last two positions before the final digit (i.e. it looks
+     * like fractional cents rather than a thousands group). */
+    char decimal_separator = 0;
+    if (first_period_index > first_comma_index) {
+        if (first_period_index >= last_digit_index - 2) {
+            decimal_separator = '.';
+        }
+    } else if (first_comma_index >= 0 &&
+               first_comma_index >= last_digit_index - 2) {
+        decimal_separator = ',';
+    }
+
+    size_t out_index = 0;
+    for (int index = 0; input[index] != '\0'; index++) {
+        if (out_index + 1 >= out_buffer_size) {
+            return false;
+        }
+        char character = input[index];
+        if (character == '(' || character == '-') {
+            /* Accounting notation "(1.23)" and a leading '-' both mean negative. */
+            out_buffer[out_index++] = '-';
+        } else if (character >= '0' && character <= '9') {
+            out_buffer[out_index++] = character;
+        } else if (character == decimal_separator) {
+            out_buffer[out_index++] = '.';
+        }
+    }
+    out_buffer[out_index] = '\0';
+    return true;
+}
+
+/*
+ * Parse a UUID text value ("543c5e21-435a-440b-943c-64af1ad571f1") into a
+ * packed SQLGUID. This is a modern port of the original driver's char2guid().
+ *
+ * Data1 is parsed through a temporary unsigned int because SQLGUID.Data1 is an
+ * "unsigned long" on some platforms and "unsigned int" on others; "%08X" always
+ * matches an unsigned int. Returns false when the text is not a well-formed
+ * UUID (fewer than the 11 expected fields), which the caller maps to SQLSTATE
+ * 07006 — matching the original's COPY_GENERAL_ERROR / unsupported-type result.
+ */
+static bool parse_uuid_text(const char *text, SQLGUID *guid)
+{
+    unsigned int data1 = 0;
+    int matched = sscanf(text,
+        "%08X-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX",
+        &data1,
+        &guid->Data2, &guid->Data3,
+        &guid->Data4[0], &guid->Data4[1],
+        &guid->Data4[2], &guid->Data4[3],
+        &guid->Data4[4], &guid->Data4[5],
+        &guid->Data4[6], &guid->Data4[7]);
+    if (matched < 11) {
+        return false;
+    }
+    guid->Data1 = data1;
+    return true;
+}
+
+/*
+ * True when SQL_C_BINARY may render a column of this PostgreSQL type as its raw
+ * text bytes.
+ *
+ * The original driver only lets SQL_C_BINARY pass through the textual bytes for
+ * an explicit allow-list of character-like types (see convert.c's
+ * text_bin_handling). Every other type either has a dedicated binary form
+ * (int4, uuid, bytea handled separately by the caller) or returns
+ * "unsupported type". Reproducing this list is what makes, e.g., int8 or float4
+ * report 07006 for SQL_C_BINARY instead of leaking their text bytes.
+ */
+static bool field_type_allows_text_binary(unsigned int postgres_oid)
+{
+    switch (postgres_oid) {
+    case PG_TYPE_UNKNOWN:
+    case PG_TYPE_BPCHAR:
+    case PG_TYPE_VARCHAR:
+    case PG_TYPE_TEXT:
+    case PG_TYPE_XML:
+    case PG_TYPE_BPCHARARRAY:
+    case PG_TYPE_VARCHARARRAY:
+    case PG_TYPE_TEXTARRAY:
+    case PG_TYPE_XMLARRAY:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* A parsed date/time, filled by parse_datetime_text. Fields default to zero.
  * fraction is in nanoseconds, matching TIMESTAMP_STRUCT.fraction. */
 typedef struct ParsedDateTime {
@@ -278,32 +450,21 @@ typedef struct ParsedDateTime {
  * Parse a PostgreSQL date/time/timestamp text value into its components.
  *
  * Recognizes "YYYY-MM-DD", "HH:MM:SS[.ffffff]", and
- * "YYYY-MM-DD HH:MM:SS[.ffffff]". Missing date parts are substituted with the
- * current local date, and missing time parts are zero — this mirrors the
- * original driver, so casting an empty string to a date target yields today's
- * date. Any fractional-seconds text is scaled to nanoseconds.
+ * "YYYY-MM-DD HH:MM:SS[.ffffff]" (with an optional trailing timezone offset,
+ * which is ignored). Only the components actually present in the text are set;
+ * everything else is left zero. Any fractional-seconds text is scaled to
+ * nanoseconds.
+ *
+ * This is a pure parser: it never substitutes the current date. Callers that
+ * want the original driver's "fill missing date parts with today" behavior
+ * (SQL_C_DATE / SQL_C_TIMESTAMP) apply that substitution themselves, so that
+ * targets which must stay zeroed (SQL_C_TIME) are unaffected.
  *
  * Returns true when at least a date or a time component was recognized.
  */
 static bool parse_datetime_text(const char *text, ParsedDateTime *out)
 {
     memset(out, 0, sizeof(*out));
-
-    /* Default the date portion to the current local date, so that time-only or
-     * empty inputs still produce a valid date (matching the original driver's
-     * substitution of the current year/month/day). We use the C-standard
-     * localtime() (rather than the POSIX localtime_r, which is not declared
-     * under strict c11) and copy its result immediately into a local struct to
-     * minimize the window in which another localtime()/gmtime() call could
-     * overwrite the shared static buffer. */
-    time_t now = time(NULL);
-    const struct tm *local_now_ptr = localtime(&now);
-    if (local_now_ptr) {
-        struct tm local_now = *local_now_ptr;
-        out->year = local_now.tm_year + 1900;
-        out->month = (unsigned int)(local_now.tm_mon + 1);
-        out->day = (unsigned int)local_now.tm_mday;
-    }
 
     int year, month, day, hour, minute, second;
     char fraction_text[16] = "";
@@ -332,7 +493,7 @@ static bool parse_datetime_text(const char *text, ParsedDateTime *out)
         return true;
     }
 
-    /* Time only (optional fractional seconds); date stays at today. */
+    /* Time only (optional fractional seconds). */
     scanned = sscanf(text, "%d:%d:%d.%15s", &hour, &minute, &second, fraction_text);
     if (scanned >= 3) {
         out->hour = (unsigned int)hour; out->minute = (unsigned int)minute;
@@ -345,9 +506,36 @@ static bool parse_datetime_text(const char *text, ParsedDateTime *out)
         return true;
     }
 
-    /* Empty or unrecognized input: keep today's date, zero time. Treated as a
-     * successful "current date" substitution. */
-    return true;
+    return false;
+}
+
+/*
+ * Fill any zero year/month/day in a parsed value with the current local date.
+ *
+ * The original driver applies this "sanity check" substitution only for
+ * SQL_C_DATE and SQL_C_TIMESTAMP targets, so a value that carries a time but no
+ * date (or is empty) still yields a usable date. We use C-standard localtime()
+ * (POSIX localtime_r is not declared under strict C11) and immediately copy its
+ * result into a local struct to minimize the window in which another
+ * localtime()/gmtime() call could overwrite the shared static buffer.
+ */
+static void fill_missing_date_with_today(ParsedDateTime *parsed)
+{
+    time_t now = time(NULL);
+    const struct tm *local_now_ptr = localtime(&now);
+    if (!local_now_ptr) {
+        return;
+    }
+    struct tm local_now = *local_now_ptr;
+    if (parsed->year == 0) {
+        parsed->year = local_now.tm_year + 1900;
+    }
+    if (parsed->month == 0) {
+        parsed->month = (unsigned int)(local_now.tm_mon + 1);
+    }
+    if (parsed->day == 0) {
+        parsed->day = (unsigned int)local_now.tm_mday;
+    }
 }
 
 /*
@@ -514,10 +702,21 @@ static bool parse_interval_text(SQLSMALLINT c_type, int fraction_precision,
         return true;
     }
 
-    /* Shape 6: "HH:MM:SS[.frac]" — a bare time component. */
+    /* Shape 6: "HH:MM:SS.frac" — a bare time component WITH fractional seconds.
+     *
+     * A bare time WITHOUT a fraction is deliberately rejected. The original
+     * driver reaches this shape only through its width-limited secure_sscanf:
+     * its preceding "%d %10s %d" probe consumes a plain "HH:MM:SS" as two
+     * fields (an int and a 10-char string) and returns FALSE, whereas
+     * "HH:MM:SS.ffffff" yields three fields there and falls through to here.
+     * The net, testable rule is that a lone time only converts to an interval
+     * when it carries a fractional part, so real time-typed values like
+     * "13:23:34" and mislabeled values like a macaddr report "unknown interval
+     * type" rather than being silently parsed. We require scanned == 4 (the
+     * fractional field present) to reproduce that. */
     scanned = sscanf(text, "%02d:%02d:%02d.%15s",
                      &hours, &minutes, &seconds, fraction_text);
-    if (scanned == 3 || scanned == 4) {
+    if (scanned == 4) {
         negative = hours < 0;
         out->interval_type = subtype;
         out->interval_sign = negative ? SQL_TRUE : SQL_FALSE;
@@ -631,6 +830,23 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         }
     }
 
+    /* Money normalization: strip the currency symbol and separators so numeric
+     * targets can parse the amount. The original driver does this for every
+     * target type EXCEPT SQL_C_CHAR / SQL_C_WCHAR, which intentionally keep the
+     * formatted "$1.23" text. (SQL_C_BINARY of money still reaches the numeric
+     * side here, is de-symboled, and is then rejected as an unsupported type in
+     * the SQL_C_BINARY case below — matching the original.) The buffer is scoped
+     * to the whole function so effective_value stays valid through the switch. */
+    char money_number_buffer[NUMERIC_TEXT_BUFFER_SIZE];
+    if (postgres_oid == PG_TYPE_MONEY &&
+        target_type != SQL_C_CHAR && target_type != SQL_C_WCHAR) {
+        if (convert_money_to_plain_number(effective_value, money_number_buffer,
+                                          sizeof(money_number_buffer))) {
+            effective_value = money_number_buffer;
+            effective_length = (int)strlen(money_number_buffer);
+        }
+    }
+
     switch (target_type) {
     case SQL_C_CHAR: {
         /* bytea columns are presented to SQL_C_CHAR as a hex string of the
@@ -642,6 +858,14 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         const char *char_value = effective_value;
         int char_length = effective_length;
         char *bytea_hex = NULL;
+
+        /* timestamptz text carries a trailing timezone offset ("...18-08"). The
+         * original driver reformats timestamptz from its parsed components with
+         * no zone, so the visible character form has none. We reproduce that by
+         * trimming the offset from the reported length. */
+        if (postgres_oid == PG_TYPE_TIMESTAMPTZ) {
+            char_length = timestamptz_text_length_without_zone(char_value, char_length);
+        }
 
         if (postgres_oid == PG_TYPE_BYTEA) {
             bool is_hex_format = (effective_length >= 2 &&
@@ -798,8 +1022,14 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
     }
 
     case SQL_C_BIT: {
-        /* After boolean normalization, effective_value is "1"/"0" for booleans */
-        unsigned char value = (effective_value[0] == 't' || effective_value[0] == '1') ? 1 : 0;
+        /* The original driver stores pg_atoi(text) — i.e. (int)strtol(text,10)
+         * — directly into a one-byte cell, keeping only the low 8 bits with no
+         * range clamp. So "1234567890" (int8) yields 210 (1234567890 mod 256),
+         * "12345" yields 57, and non-numeric text yields 0. Booleans were
+         * already normalized to "1"/"0" above, so "true" becomes 1. We
+         * replicate the low-byte truncation exactly rather than clamping to
+         * 0/1, because the regression test pins these wrapped values. */
+        unsigned char value = (unsigned char)(int)strtol(effective_value, NULL, 10);
         if (target_value) {
             *(unsigned char *)target_value = value;
         }
@@ -862,6 +1092,14 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         const char *wchar_source = effective_value;
         int wchar_source_length = effective_length;
         char *bytea_wchar_hex = NULL;
+
+        /* Strip the trailing timezone offset from timestamptz text, as in the
+         * SQL_C_CHAR case above. */
+        if (postgres_oid == PG_TYPE_TIMESTAMPTZ) {
+            wchar_source_length =
+                timestamptz_text_length_without_zone(wchar_source, wchar_source_length);
+        }
+
         if (postgres_oid == PG_TYPE_BYTEA) {
             bool is_hex_format = (effective_length >= 2 &&
                                   effective_value[0] == '\\' &&
@@ -966,9 +1204,28 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
 
         SQLWCHAR *destination = (SQLWCHAR *)target_value;
         memcpy(destination, units, (size_t)copy_units * sizeof(SQLWCHAR));
-        destination[copy_units] = 0;  /* UTF-16 null terminator */
 
-        bool truncated = (copy_units < (SQLLEN)unit_count);
+        /* Write the UTF-16 null terminator, but never past the buffer. When the
+         * buffer has room for fewer than sizeof(SQLWCHAR) trailing bytes (only
+         * possible with a 1-byte buffer, since max_units reserves a full unit
+         * whenever buffer_length >= 2), write just the low byte(s) that fit.
+         * The original test pins this: an empty string into a 1-byte buffer must
+         * leave a single 0x00 at offset 0 without clobbering the next byte. */
+        SQLLEN terminator_offset_bytes = copy_units * (SQLLEN)sizeof(SQLWCHAR);
+        SQLLEN terminator_bytes_available = buffer_length - terminator_offset_bytes;
+        SQLLEN terminator_bytes_to_write =
+            (terminator_bytes_available < (SQLLEN)sizeof(SQLWCHAR))
+                ? terminator_bytes_available
+                : (SQLLEN)sizeof(SQLWCHAR);
+        if (terminator_bytes_to_write > 0) {
+            memset((char *)target_value + terminator_offset_bytes, 0,
+                   (size_t)terminator_bytes_to_write);
+        }
+
+        /* A terminator that could not be written in full means the data did not
+         * fit, i.e. truncation. */
+        bool truncated = (copy_units < (SQLLEN)unit_count) ||
+                         terminator_bytes_to_write < (SQLLEN)sizeof(SQLWCHAR);
         free(units);
 
         if (truncated) {
@@ -1008,9 +1265,69 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         return SQL_SUCCESS;
     }
 
+    /* SQL_C_VARBOOKMARK shares SQL_C_BINARY's numeric value, so it lands here
+     * too and is handled identically — that is what the test exercises. */
     case SQL_C_BINARY: {
-        /* bytea columns decode to their raw bytes (from either the hex or escape
-         * text format). All other types return their text bytes verbatim. */
+        /* Only a few source types have a meaningful binary form; every other
+         * type reports 07006 (matching the original driver's SQL_C_BINARY
+         * switch, which special-cases int4 and uuid, hex/text-passes an
+         * allow-list of character types, and rejects the rest):
+         *   - int4   -> the value as a 4-byte native (little-endian) integer
+         *   - uuid   -> the 16-byte packed SQLGUID
+         *   - bytea  -> the raw decoded bytes
+         *   - character-like allow-list -> the raw text bytes verbatim
+         *     (the test prints these as hex, e.g. text "textdata" -> 7465...). */
+        if (postgres_oid == PG_TYPE_INT4) {
+            SQLINTEGER integer_value = (SQLINTEGER)strtol(effective_value, NULL, 10);
+            if (indicator_or_length) {
+                *indicator_or_length = (SQLLEN)sizeof(integer_value);
+            }
+            if (!target_value || buffer_length <= 0) {
+                return SQL_SUCCESS;
+            }
+            if (buffer_length >= (SQLLEN)sizeof(integer_value)) {
+                memcpy(target_value, &integer_value, sizeof(integer_value));
+                return SQL_SUCCESS;
+            }
+            memcpy(target_value, &integer_value, (size_t)buffer_length);
+            diagnostics_add_record(&statement->diagnostics, "01004", 0,
+                                   "Binary data was truncated in SQLGetData.");
+            return SQL_SUCCESS_WITH_INFO;
+        }
+
+        if (postgres_oid == PG_TYPE_UUID) {
+            SQLGUID guid;
+            memset(&guid, 0, sizeof(guid));
+            if (!parse_uuid_text(effective_value, &guid)) {
+                diagnostics_add_record(&statement->diagnostics, "07006", 0,
+                                       "Received an unsupported type from Postgres.");
+                return SQL_ERROR;
+            }
+            if (indicator_or_length) {
+                *indicator_or_length = (SQLLEN)sizeof(guid);
+            }
+            if (!target_value || buffer_length <= 0) {
+                return SQL_SUCCESS;
+            }
+            if (buffer_length >= (SQLLEN)sizeof(guid)) {
+                memcpy(target_value, &guid, sizeof(guid));
+                return SQL_SUCCESS;
+            }
+            memcpy(target_value, &guid, (size_t)buffer_length);
+            diagnostics_add_record(&statement->diagnostics, "01004", 0,
+                                   "Binary data was truncated in SQLGetData.");
+            return SQL_SUCCESS_WITH_INFO;
+        }
+
+        if (postgres_oid != PG_TYPE_BYTEA &&
+            !field_type_allows_text_binary(postgres_oid)) {
+            diagnostics_add_record(&statement->diagnostics, "07006", 0,
+                                   "Received an unsupported type from Postgres.");
+            return SQL_ERROR;
+        }
+
+        /* bytea decodes to raw bytes; the character allow-list passes its text
+         * bytes through unchanged. */
         const char *binary_source = effective_value;
         int binary_length = effective_length;
         unsigned char *decoded_bytea = NULL;
@@ -1092,10 +1409,17 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
 
     case SQL_C_TYPE_DATE:
     case SQL_C_DATE: {
-        /* Extract the date portion; an empty/time-only value substitutes the
-         * current date (see parse_datetime_text). */
+        /* Only genuine date/time field types carry a date to extract; for any
+         * other source type the components stay zero (matching the original
+         * driver, which populates its time struct only for those types). A zero
+         * date (empty value, or a non-date source) is then filled with today,
+         * as the original does for SQL_C_DATE/SQL_C_TIMESTAMP. */
         ParsedDateTime parsed;
-        parse_datetime_text(effective_value, &parsed);
+        memset(&parsed, 0, sizeof(parsed));
+        if (field_type_is_datetime(postgres_oid)) {
+            parse_datetime_text(effective_value, &parsed);
+        }
+        fill_missing_date_with_today(&parsed);
         DATE_STRUCT date_value;
         date_value.year = (SQLSMALLINT)parsed.year;
         date_value.month = (SQLUSMALLINT)parsed.month;
@@ -1111,8 +1435,13 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
 
     case SQL_C_TYPE_TIME:
     case SQL_C_TIME: {
+        /* Time targets never substitute the current time: a non-time source
+         * yields 00:00:00. Only real date/time field types are parsed. */
         ParsedDateTime parsed;
-        parse_datetime_text(effective_value, &parsed);
+        memset(&parsed, 0, sizeof(parsed));
+        if (field_type_is_datetime(postgres_oid)) {
+            parse_datetime_text(effective_value, &parsed);
+        }
         TIME_STRUCT time_value;
         time_value.hour = (SQLUSMALLINT)parsed.hour;
         time_value.minute = (SQLUSMALLINT)parsed.minute;
@@ -1128,8 +1457,14 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
 
     case SQL_C_TYPE_TIMESTAMP:
     case SQL_C_TIMESTAMP: {
+        /* Like SQL_C_DATE: parse only real date/time types, then fill a missing
+         * date with today (the time portion stays whatever was parsed). */
         ParsedDateTime parsed;
-        parse_datetime_text(effective_value, &parsed);
+        memset(&parsed, 0, sizeof(parsed));
+        if (field_type_is_datetime(postgres_oid)) {
+            parse_datetime_text(effective_value, &parsed);
+        }
+        fill_missing_date_with_today(&parsed);
         TIMESTAMP_STRUCT timestamp_value;
         timestamp_value.year = (SQLSMALLINT)parsed.year;
         timestamp_value.month = (SQLUSMALLINT)parsed.month;
@@ -1147,10 +1482,31 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         return SQL_SUCCESS;
     }
 
+    case SQL_C_GUID: {
+        /* The original driver runs char2guid() on the text of any source type
+         * and reports 07006 when it is not a well-formed UUID. So a UUID-shaped
+         * string (whatever its column type) converts, and everything else — a
+         * money amount, a timestamp, etc. — fails as an unsupported type. */
+        SQLGUID guid;
+        memset(&guid, 0, sizeof(guid));
+        if (!parse_uuid_text(effective_value, &guid)) {
+            diagnostics_add_record(&statement->diagnostics, "07006", 0,
+                                   "Received an unsupported type from Postgres.");
+            return SQL_ERROR;
+        }
+        if (target_value) {
+            memcpy(target_value, &guid, sizeof(guid));
+        }
+        if (indicator_or_length) {
+            *indicator_or_length = (SQLLEN)sizeof(guid);
+        }
+        return SQL_SUCCESS;
+    }
+
     default:
-        /* Types we do not convert (e.g. SQL_C_GUID from arbitrary text,
-         * SQL_C_INTERVAL_DAY_TO_MINUTE) report 07006, matching the original
-         * driver's COPY_UNSUPPORTED_TYPE ("Received an unsupported type"). */
+        /* Types we do not convert (e.g. SQL_C_INTERVAL_DAY_TO_MINUTE) report
+         * 07006, matching the original driver's COPY_UNSUPPORTED_TYPE
+         * ("Received an unsupported type"). */
         diagnostics_add_record(&statement->diagnostics,
                                "07006",  /* Restricted data type attribute violation */
                                0,
