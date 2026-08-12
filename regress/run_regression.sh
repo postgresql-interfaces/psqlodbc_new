@@ -127,7 +127,7 @@ export ODBCINI="$WORK_DIR/odbc.ini"
 # "non-standard string literals are not supported"). The quotes and
 # error-rollback tests skip their scs=off blocks on servers >= 19, so their
 # output no longer matches the generic expected file — it matches the v19 one.
-SERVER_MAJOR_VERSION=$(psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" \
+SERVER_MAJOR_VERSION=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DATABASE" \
     -tAc "SELECT current_setting('server_version_num')::int / 10000" 2>/dev/null | tr -d '[:space:]')
 
 # Pick the applicable version-specific expected directory.
@@ -181,9 +181,9 @@ cc $CFLAGS -c "$ORIG_TEST_DIR/src/common.c" -o "$WORK_DIR/exe/common.o" 2>/dev/n
 # reads and asserts exact rows of testtab1). Dropping and recreating the schema
 # guarantees a deterministic starting point regardless of run order.
 load_sample_tables() {
-    psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q \
+    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DATABASE" -q \
         -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" 2>/dev/null || true
-    psql -h "$PG_HOST" -p "$PG_PORT" -d "$PG_DATABASE" -q \
+    psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DATABASE" -q \
         -f "$ORIG_TEST_DIR/sampletables.sql" 2>/dev/null
 }
 

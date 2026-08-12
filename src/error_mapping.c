@@ -88,8 +88,20 @@ void error_extract_from_result(const PGresult *result,
     }
 
     /* Build the combined message. Start with "<severity>: <primary>", then
-     * append DETAIL and HINT on separate lines if available. This matches
-     * what psql displays and what applications expect. */
+     * append DETAIL but NOT HINT.
+     *
+     * This mirrors the original psqlodbc driver, which gates each optional
+     * field on a "display_error_level" that defaults to 1 (connection.c):
+     * DETAIL is appended when the level is > 0, HINT only when it is > 1. With
+     * the default level a server's HINT is therefore suppressed. Matching this
+     * matters across server versions because different releases attach
+     * different secondary fields to the same error — e.g. "function ... does
+     * not exist" carries a HINT on PostgreSQL 17 but a DETAIL on 20 — and the
+     * upstream expected outputs (which never contain "HINT:") were captured
+     * with the default level. Appending HINT here makes error-rollback fail on
+     * any server that emits one. The (unused-by-default) higher levels are not
+     * yet exposed as a connection option, so we hard-code level 1 behavior. */
+    (void)hint_message;
     int written;
     if (severity) {
         written = snprintf(out_message, message_buffer_size, "%s: %s",
@@ -99,15 +111,9 @@ void error_extract_from_result(const PGresult *result,
     }
 
     if (detail_message && written > 0 && (size_t)written < message_buffer_size) {
-        written += snprintf(out_message + written,
-                            message_buffer_size - (size_t)written,
-                            "\nDETAIL: %s", detail_message);
-    }
-
-    if (hint_message && written > 0 && (size_t)written < message_buffer_size) {
         snprintf(out_message + written,
                  message_buffer_size - (size_t)written,
-                 "\nHINT: %s", hint_message);
+                 "\nDETAIL: %s", detail_message);
     }
 }
 

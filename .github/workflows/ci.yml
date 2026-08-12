@@ -80,9 +80,9 @@ jobs:
 
     # Upstream psqlodbc regression suite: compile the original test programs
     # against our driver and diff against upstream's expected output. This is the
-    # coverage-parity signal. It is NON-BLOCKING for now (continue-on-error)
-    # because not all 60 tests pass yet; the step prints the pass/fail/skip
-    # summary so regressions are visible without failing the build.
+    # coverage-parity signal. All 60 upstream tests pass, so the step is BLOCKING
+    # — a regression (any FAIL) fails the build. The script prints the
+    # pass/fail/skip summary either way.
     - name: Checkout upstream psqlodbc (for regression tests)
       if: matrix.os == 'ubuntu-latest'
       uses: actions/checkout@v4
@@ -90,9 +90,8 @@ jobs:
         repository: postgresql-interfaces/psqlodbc
         path: upstream-psqlodbc
 
-    - name: Regression suite (upstream parity, non-blocking)
+    - name: Regression suite (upstream parity)
       if: matrix.os == 'ubuntu-latest'
-      continue-on-error: true
       run: regress/run_regression.sh
       env:
         PSQLODBC_ORIG_DIR: ${{ github.workspace }}/upstream-psqlodbc
@@ -100,6 +99,10 @@ jobs:
         PG_PORT: "5432"
         PG_DATABASE: contrib_regression
         PG_USER: postgres
+        # psql in run_regression.sh connects with -U "$PG_USER"; PGPASSWORD and
+        # PGUSER cover the libpq-authenticated test binaries (whose odbc.ini
+        # entry carries no password) against the password-protected service.
+        PGUSER: postgres
         PGPASSWORD: postgres
 
   windows:
