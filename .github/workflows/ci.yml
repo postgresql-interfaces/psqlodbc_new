@@ -95,14 +95,21 @@ jobs:
     # pgapifunc.h -> psqlodbc.h chain, which needs the generated config.h.
     # config.h and configure are NOT committed upstream — they are produced by
     # bootstrap (autoreconf) + configure. Without this the test fails to compile
-    # and the suite would be one test short of full coverage. --with-unixodbc
-    # selects the unixODBC headers (matching this runner's libodbc).
+    # and the suite would be one test short of full coverage.
+    #
+    # We pass the special value __without_odbc_config to --with-unixodbc: it
+    # still #defines WITH_UNIXODBC (which selects the unixODBC <sql.h> path in
+    # psqlodbc.h) but skips upstream's requirement for the odbc_config binary.
+    # Debian/Ubuntu's unixodbc-dev does not ship odbc_config (it provides a
+    # pkg-config "odbc" module instead), so a plain --with-unixodbc fails with
+    # "odbc_config not found". The regression harness supplies the actual ODBC
+    # cflags/libs via pkg-config, so odbc_config is not otherwise needed.
     - name: Configure upstream psqlodbc (generate config.h)
       if: matrix.os == 'ubuntu-latest'
       working-directory: upstream-psqlodbc
       run: |
         ./bootstrap
-        ./configure --with-unixodbc
+        ./configure --with-unixodbc=__without_odbc_config
 
     - name: Regression suite (upstream parity)
       if: matrix.os == 'ubuntu-latest'
