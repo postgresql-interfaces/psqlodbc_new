@@ -47,7 +47,8 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y \
           meson ninja-build \
-          libpq-dev unixodbc-dev libodbcinst2
+          libpq-dev unixodbc-dev libodbcinst2 \
+          autoconf automake libtool
 
     - name: Install dependencies (macOS)
       if: matrix.os == 'macos-latest'
@@ -89,6 +90,19 @@ jobs:
       with:
         repository: postgresql-interfaces/psqlodbc
         path: upstream-psqlodbc
+
+    # One upstream test (params-batch-exec) includes the driver's internal
+    # pgapifunc.h -> psqlodbc.h chain, which needs the generated config.h.
+    # config.h and configure are NOT committed upstream — they are produced by
+    # bootstrap (autoreconf) + configure. Without this the test fails to compile
+    # and the suite would be one test short of full coverage. --with-unixodbc
+    # selects the unixODBC headers (matching this runner's libodbc).
+    - name: Configure upstream psqlodbc (generate config.h)
+      if: matrix.os == 'ubuntu-latest'
+      working-directory: upstream-psqlodbc
+      run: |
+        ./bootstrap
+        ./configure --with-unixodbc
 
     - name: Regression suite (upstream parity)
       if: matrix.os == 'ubuntu-latest'

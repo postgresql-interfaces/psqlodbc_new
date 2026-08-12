@@ -236,11 +236,22 @@ for test_name in $TESTS; do
         continue
     fi
 
-    # Compile the test
+    # Compile the test.
+    #
+    # A compilation failure is a FAIL, not a SKIP. A test that does not even
+    # build has NOT been shown to pass, so silently skipping it would let a
+    # real coverage gap masquerade as success — exactly what happened when
+    # params-batch-exec (the only test that includes the upstream driver's
+    # generated config.h via pgapifunc.h) failed to compile against an
+    # un-configured upstream checkout in CI while the suite still reported
+    # green. We surface the compiler output so the cause is visible.
     exe_file="$WORK_DIR/exe/${test_name}-test"
-    if ! cc $CFLAGS -I"$WORK_DIR" "$src_file" "$WORK_DIR/exe/common.o" -o "$exe_file" $LDFLAGS 2>/dev/null; then
-        echo "SKIP: $test_name (compilation failed)"
-        SKIP=$((SKIP + 1))
+    compile_log="$WORK_DIR/results/${test_name}.compile.log"
+    if ! cc $CFLAGS -I"$WORK_DIR" "$src_file" "$WORK_DIR/exe/common.o" -o "$exe_file" $LDFLAGS >"$compile_log" 2>&1; then
+        echo "FAIL: $test_name (compilation failed)"
+        head -20 "$compile_log" | sed 's/^/      /'
+        echo "      ..."
+        FAIL=$((FAIL + 1))
         continue
     fi
 
