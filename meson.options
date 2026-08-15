@@ -4,3 +4,15 @@ option('driver_manager',
     value : 'auto',
     description : 'Which ODBC Driver Manager to link against',
 )
+
+# Explicit libpq install prefix (expects <prefix>/include/libpq-fe.h and
+# <prefix>/lib/libpq.lib|libpq.so|...). When set, the build links libpq via
+# find_library against this prefix instead of pkg-config. Needed on Windows
+# where Meson's MSVC pkg-config backend drops vcpkg's "-llibpq" flag, so the
+# driver would compile but fail to link (unresolved PQ* symbols). Empty means
+# "use pkg-config, then fall back to well-known system paths" as before.
+option('libpq_prefix',
+    type : 'string',
+    value : '',
+    description : 'Explicit libpq install prefix (bypasses pkg-config for libpq)',
+)

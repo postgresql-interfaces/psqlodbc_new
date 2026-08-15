@@ -39,8 +39,36 @@ else  # auto
 endif
 
 # Locate PostgreSQL client library (libpq) for connecting to the database.
-# Strategy: try pkg-config first, then probe common install locations per platform.
-libpq_dep = dependency('libpq', required : false)
+# Strategy: an explicit libpq_prefix wins (used on Windows/vcpkg, see below);
+# otherwise try pkg-config, then probe common install locations per platform.
+libpq_prefix = get_option('libpq_prefix')
+if libpq_prefix != ''
+    # Explicit prefix: link via find_library rather than pkg-config. On MSVC,
+    # Meson's pkg-config backend drops vcpkg's "-llibpq" link flag, so a
+    # pkg-config-resolved libpq compiles but fails to link. find_library against
+    # the prefix's lib/ produces a correct, arch-matched link.
+    cc = meson.get_compiler('c')
+    # The import/shared library is named "libpq.lib" on Windows (vcpkg/MSVC) but
+    # "libpq.so"/"libpq.dylib" on Unix, whose canonical find_library name is
+    # "pq". Try the Windows name first, then the Unix name, so a single option
+    # works across platforms.
+    libpq_lib = cc.find_library('libpq',
+        dirs : [libpq_prefix / 'lib'],
+        required : false,
+    )
+    if not libpq_lib.found()
+        libpq_lib = cc.find_library('pq',
+            dirs : [libpq_prefix / 'lib'],
+            required : true,
+        )
+    endif
+    libpq_dep = declare_dependency(
+        dependencies : libpq_lib,
+        include_directories : include_directories(libpq_prefix / 'include'),
+    )
+else
+    libpq_dep = dependency('libpq', required : false)
+endif
 if not libpq_dep.found()
     cc = meson.get_compiler('c')
 

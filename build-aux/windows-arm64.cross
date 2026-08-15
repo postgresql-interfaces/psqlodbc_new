@@ -1,0 +1,24 @@
+# Meson cross file for building the Windows ARM64 driver on an x64 CI host.
+#
+# GitHub's windows-latest runners are x64, so an ARM64 build is a cross build:
+# cl.exe (via the amd64_arm64 MSVC toolset) emits ARM64 code that cannot execute
+# on the host. This file tells Meson the target is ARM64 and — crucially — that
+# it must NOT run compiled test programs to probe the toolchain (they would fail
+# with a bad-image error). The MSVC environment (cl/link on PATH) is set up by
+# the ilammy/msvc-dev-cmd step in release.yml before Meson is invoked.
+
+[binaries]
+c = 'cl'
+cpp = 'cl'
+ar = 'lib'
+windres = 'rc'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+
+[properties]
+# Never execute target binaries during configure — the host is x64.
+needs_exe_wrapper = true

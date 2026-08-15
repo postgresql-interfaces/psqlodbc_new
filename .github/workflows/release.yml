@@ -11,6 +11,9 @@ permissions:
   contents: write
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Unix builds (Linux + macOS): produce stripped shared objects in a tarball.
+  # ---------------------------------------------------------------------------
   build-release:
     strategy:
       fail-fast: false
@@ -43,6 +46,13 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    # ref_name can be a tag (v1.2.3) or, for a workflow_dispatch dry run, a
+    # branch name that may contain a slash (e.g. ci/windows-msi-release). A
+    # slash in an artifact filename makes tar treat the leading segment as a
+    # directory and fail, so collapse any path separators to dashes.
+    - name: Compute package version
+      run: echo "PKG_VERSION=$(echo '${{ github.ref_name }}' | tr '/' '-')" >> "$GITHUB_ENV"
+
     - name: Configure (release)
       run: meson setup builddir --buildtype=release --strip
 
@@ -54,17 +64,170 @@ jobs:
         mkdir -p dist
         cp builddir/src/libpsqlodbc2w* dist/ 2>/dev/null || true
         cp LICENSE dist/
-        tar -czf psqlodbc2-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz -C dist .
+        tar -czf psqlodbc2-${PKG_VERSION}-${{ matrix.artifact_suffix }}.tar.gz -C dist .
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: psqlodbc2-${{ matrix.artifact_suffix }}
-        path: psqlodbc2-${{ github.ref_name }}-${{ matrix.artifact_suffix }}.tar.gz
+        path: psqlodbc2-${{ env.PKG_VERSION }}-${{ matrix.artifact_suffix }}.tar.gz
         retention-days: 5
 
+  # ---------------------------------------------------------------------------
+  # Windows builds (x64 + arm64): build the driver DLL with MSVC/Meson, bundle
+  # the libpq runtime DLLs beside it, and wrap everything in a WiX MSI that
+  # registers the driver with the Windows ODBC subsystem. This mirrors how
+  # upstream psqlodbc ships psqlodbc_x64.msi — an end user just runs the MSI and
+  # the driver appears in the ODBC Data Source Administrator.
+  # ---------------------------------------------------------------------------
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arch      = MSVC target passed to Meson / vcpkg triplet selector
+          # msvc_arch = argument to msvc-dev-cmd (amd64, or amd64_arm64 cross)
+          # vcpkg_triplet chooses the prebuilt libpq flavor to link against
+          - arch: x64
+            msvc_arch: amd64
+            vcpkg_triplet: x64-windows
+            cross_file: ""
+          - arch: arm64
+            msvc_arch: amd64_arm64
+            vcpkg_triplet: arm64-windows
+            cross_file: "--cross-file build-aux/windows-arm64.cross"
+
+    name: Build (windows-${{ matrix.arch }})
+    runs-on: windows-latest
+
+    # Route vcpkg's binary cache to a NuGet feed hosted on GitHub Packages. On a
+    # hit, `vcpkg install libpq` restores a prebuilt package in seconds instead
+    # of compiling libpq + OpenSSL/zlib/lz4 from source (~10-15 min). The vcpkg
+    # "x-gha" (Actions cache) provider was REMOVED in 2025, so NuGet is the
+    # supported GitHub-native option. The package id embeds vcpkg's ABI hash, so
+    # each triplet gets its own entry and a dependency/compiler change
+    # invalidates automatically — no manual key to maintain.
+    # Writing to GitHub Packages needs the packages:write permission (below).
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;nuget,GitHubPackages,readwrite"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up MSVC (${{ matrix.msvc_arch }})
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.msvc_arch }}
+
+    - name: Install Meson + Ninja
+      run: pip install meson ninja
+
+    # Register the GitHub Packages NuGet feed as a vcpkg binary source. vcpkg
+    # ships its own nuget.exe; we point it at this repo's owner feed and
+    # authenticate with the job's GITHUB_TOKEN.
+    - name: Configure vcpkg NuGet binary cache
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $nugetSource = "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+        $nuget = & "$env:VCPKG_INSTALLATION_ROOT/vcpkg" fetch nuget | Select-Object -Last 1
+        & $nuget sources add -Source $nugetSource -Name GitHubPackages `
+          -Username '${{ github.repository_owner }}' -Password $env:GITHUB_TOKEN `
+          -StorePasswordInClearText
+        & $nuget setapikey $env:GITHUB_TOKEN -Source $nugetSource
+
+    # libpq is not on the runner by default. vcpkg builds a per-triplet libpq
+    # (with its OpenSSL/zlib/lz4 deps) matching the target architecture under
+    # installed/<triplet>/. Restored from the NuGet binary cache when available.
+    - name: Install libpq via vcpkg
+      shell: pwsh
+      run: |
+        vcpkg install libpq:${{ matrix.vcpkg_triplet }}
+        # Expose the install prefix for meson's -Dlibpq_prefix below.
+        $installed = "$env:VCPKG_INSTALLATION_ROOT/installed/${{ matrix.vcpkg_triplet }}"
+        echo "LIBPQ_PREFIX=$installed" >> $env:GITHUB_ENV
+
+    - name: Configure (release)
+      shell: pwsh
+      run: |
+        # Link libpq via find_library against the explicit vcpkg prefix rather
+        # than pkg-config: Meson's MSVC pkg-config backend drops vcpkg's
+        # "-llibpq" flag, so a pkg-config build compiles but fails to link with
+        # unresolved PQ* symbols. -Dlibpq_prefix takes the reliable path (see
+        # meson.build) and is arch-correct for both x64 and the arm64 cross.
+        meson setup builddir --buildtype=release `
+          "-Dlibpq_prefix=$env:LIBPQ_PREFIX" ${{ matrix.cross_file }}
+
+    - name: Build
+      run: meson compile -C builddir
+
+    # Gather the driver DLL plus every runtime DLL it needs (libpq + OpenSSL +
+    # zlib, etc.) into one staging dir. The MSI's <Files> wildcard packages
+    # whatever lands here, so the installed driver has all its dependencies
+    # sitting next to it — the ODBC loader resolves them from the same folder.
+    - name: Stage payload
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path stage | Out-Null
+        Copy-Item builddir/src/psqlodbc2w.dll stage/
+        $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT/installed/${{ matrix.vcpkg_triplet }}/bin"
+        Copy-Item "$vcpkgBin/*.dll" stage/
+
+    # Pin WiX and its UI extension to the same concrete version. The extension
+    # reference must carry an exact version (or none) — a "/5.*" wildcard is
+    # rejected by `wix extension add` with "Invalid extension version".
+    - name: Install WiX toolset
+      run: dotnet tool install --global wix --version 5.0.2
+
+    - name: Add WiX UI extension
+      run: wix extension add -g WixToolset.UI.wixext/5.0.2
+
+    # MSI ProductVersion must be a 4-part numeric string (a.b.c.d). Tags look
+    # like "v1.2.3"; strip the leading v and append ".0". A manual
+    # workflow_dispatch run has no version tag, so fall back to 0.0.0.0.
+    - name: Compute MSI version
+      id: ver
+      shell: pwsh
+      run: |
+        $ref = "${{ github.ref_name }}"
+        if ($ref -match '^v(\d+)\.(\d+)\.(\d+)$') {
+          $v = "$($matches[1]).$($matches[2]).$($matches[3]).0"
+        } else {
+          # workflow_dispatch dry run (no version tag) — MSI needs a 4-part
+          # numeric ProductVersion, so use a placeholder.
+          $v = "0.0.0.0"
+        }
+        echo "msi_version=$v" >> $env:GITHUB_OUTPUT
+        # Filename version: sanitize slashes from branch refs (see Unix job).
+        echo "pkg_version=$($ref -replace '/','-')" >> $env:GITHUB_OUTPUT
+
+    - name: Build MSI
+      run: >
+        wix build installer/psqlodbc2.wxs
+        -arch ${{ matrix.arch }}
+        -d Version=${{ steps.ver.outputs.msi_version }}
+        -d BinSource=stage
+        -ext WixToolset.UI.wixext
+        -o psqlodbc2-${{ steps.ver.outputs.pkg_version }}-windows-${{ matrix.arch }}.msi
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: psqlodbc2-windows-${{ matrix.arch }}
+        path: psqlodbc2-${{ steps.ver.outputs.pkg_version }}-windows-${{ matrix.arch }}.msi
+        retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Publish: gather every platform's artifact and attach to the GitHub release.
+  # ---------------------------------------------------------------------------
   create-release:
-    needs: build-release
+    needs: [build-release, build-windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -80,4 +243,4 @@ jobs:
         makeLatest: true
         draft: false
         prerelease: false
-        artifacts: "artifacts/**/*.tar.gz"
+        artifacts: "artifacts/**/*.tar.gz,artifacts/**/*.msi"

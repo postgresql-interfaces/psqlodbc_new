@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v4/v5 installer definition for the psqlodbc2 PostgreSQL ODBC driver.
+
+  This produces a per-architecture MSI (psqlodbc2_<arch>.msi) that:
+    1. Installs the driver DLL and its libpq runtime dependencies into
+       "Program Files\psqlODBC2\<arch>\bin".
+    2. Registers the driver with the Windows ODBC subsystem by writing the
+       ODBCINST.INI entries. This is what makes the driver selectable in the
+       "ODBC Data Source Administrator" and via DSN-less connection strings
+       (Driver={PostgreSQL ODBC Driver (psqlodbc2)}). The <ODBCDriver> element
+       generates those registry rows for us — we do not hand-write them.
+
+  Values supplied on the wix build command line (see release.yml):
+    -d Version=<x.y.z.0>   product version (must be 4-part numeric for MSI)
+    -arch x64|arm64        target architecture (sets $(sys.BUILDARCH))
+    -d BinSource=<dir>     directory holding the built DLLs to harvest
+
+  UpgradeCode GUIDs are FROZEN per architecture: they must never change across
+  releases or Windows will treat a new version as a different product and fail
+  to upgrade in place. Each architecture needs its own UpgradeCode because a
+  64-bit and ARM64 build are distinct products that may not coexist.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?if $(sys.BUILDARCH) = x64 ?>
+    <?define ArchName = "x64" ?>
+    <?define UpgradeCode = "7B3F2A10-9C4E-4D1B-8A6F-2E5C1D0B4A21" ?>
+  <?elseif $(sys.BUILDARCH) = arm64 ?>
+    <?define ArchName = "arm64" ?>
+    <?define UpgradeCode = "0F8D6C22-1A3B-4E5C-9D7A-8B2C4E6F0A13" ?>
+  <?else?>
+    <?error Unsupported build architecture: only x64 and arm64 are packaged ?>
+  <?endif?>
+
+  <!-- Human-facing driver name. This exact string is what appears in the ODBC
+       Administrator and must match the Driver= keyword in connection strings. -->
+  <?define DriverName = "PostgreSQL ODBC Driver (psqlodbc2)" ?>
+  <?define DriverDll = "psqlodbc2w.dll" ?>
+
+  <Package
+    Name="psqlODBC2 ($(ArchName))"
+    Manufacturer="PostgreSQL Global Development Group"
+    Version="$(Version)"
+    UpgradeCode="$(UpgradeCode)"
+    Compressed="yes"
+    Scope="perMachine"
+    InstallerVersion="500">
+
+    <SummaryInformation
+      Keywords="PostgreSQL, ODBC, psqlodbc2"
+      Description="PostgreSQL ODBC Driver (psqlodbc2) - $(ArchName)" />
+
+    <!-- Block same-or-older installs from clobbering a newer one, and remove the
+         prior version before laying down the new files (a clean in-place upgrade). -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- All payload lives in one directory so the ODBC subsystem finds the
+         driver's dependent libpq DLLs next to the driver itself at load time. -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="BASEDIR" Name="psqlODBC2">
+        <Directory Id="ARCHDIR" Name="$(ArchName)">
+          <Directory Id="BINDIR" Name="bin" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- The driver component. The <ODBCDriver> child both places the DLL and
+         writes ODBCINST.INI. KeyPath is the DLL file so repair/upgrade track it. -->
+    <Component Id="DriverComponent" Directory="BINDIR" Guid="*">
+      <File Id="DriverDllFile"
+            Name="$(DriverDll)"
+            Source="$(BinSource)\$(DriverDll)"
+            KeyPath="yes" />
+      <ODBCDriver Id="PsqlOdbc2Driver"
+                  Name="$(DriverName)"
+                  File="DriverDllFile" />
+    </Component>
+
+    <Feature Id="Main" Title="psqlODBC2 Driver" Level="1">
+      <ComponentRef Id="DriverComponent" />
+
+      <!-- libpq and its transitive runtime DLLs (OpenSSL, zlib, gettext, ...)
+           are copied next to the driver at build time (see release.yml). The
+           <Files> wildcard auto-generates a component per DLL so this stays
+           correct regardless of which runtime DLLs libpq happens to pull in.
+           The driver DLL is excluded here because it is its own component above
+           (it carries the <ODBCDriver> registration and must keep a stable id). -->
+      <Files Include="$(BinSource)\*.dll" Directory="BINDIR">
+        <Exclude Files="$(BinSource)\$(DriverDll)" />
+      </Files>
+    </Feature>
+
+    <!-- Minimal license-acceptance UI. WixUI_Minimal is the standard single-arch
+         click-through; the driver has no configurable install options. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="installer\license.rtf" />
+
+  </Package>
+</Wix>
