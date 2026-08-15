@@ -830,6 +830,29 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
         }
     }
 
+    /* Date infinity clamping: PostgreSQL renders the special date values
+     * 'infinity' and '-infinity' as those literal words, which no ODBC client
+     * can interpret as a date. The original driver maps them to the largest and
+     * smallest representable finite dates (convert.c's PG_TYPE_DATE case sets
+     * 9999-12-31 and 0001-01-01). Substituting the equivalent text here — before
+     * any target-type conversion — lets a single change serve every target: the
+     * SQL_C_CHAR/SQL_C_WCHAR paths emit the finite date, and the date/timestamp
+     * parser used by SQL_C_TYPE_DATE parses it like any ordinary "YYYY-MM-DD". */
+    if (postgres_oid == PG_TYPE_DATE) {
+        /* PostgreSQL's finite date domain is 4713 BC .. 5874897 AD, but ODBC's
+         * DATE_STRUCT year is a signed 16-bit field, so these clamps match both
+         * the original driver and the widest value the ODBC types can hold. */
+        static const char DATE_POSITIVE_INFINITY_CLAMP[] = "9999-12-31";
+        static const char DATE_NEGATIVE_INFINITY_CLAMP[] = "0001-01-01";
+        if (ascii_case_equal(effective_value, "infinity")) {
+            effective_value = DATE_POSITIVE_INFINITY_CLAMP;
+            effective_length = (int)(sizeof(DATE_POSITIVE_INFINITY_CLAMP) - 1);
+        } else if (ascii_case_equal(effective_value, "-infinity")) {
+            effective_value = DATE_NEGATIVE_INFINITY_CLAMP;
+            effective_length = (int)(sizeof(DATE_NEGATIVE_INFINITY_CLAMP) - 1);
+        }
+    }
+
     /* Money normalization: strip the currency symbol and separators so numeric
      * targets can parse the amount. The original driver does this for every
      * target type EXCEPT SQL_C_CHAR / SQL_C_WCHAR, which intentionally keep the
