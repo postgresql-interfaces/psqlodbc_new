@@ -18,6 +18,7 @@
 #include "type_mapping.h"
 #include "results.h"
 #include "large_object.h"
+#include "platform/string_utils.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,30 +26,6 @@
 #include <stdio.h>
 
 /* ---- Internal Helpers ---- */
-
-/* Lowercase a single ASCII byte. SQL keywords are pure ASCII, so
- * locale-independent byte lowercasing is correct and avoids the POSIX/GNU
- * strcasecmp family (not C11; MSVC spells them _stricmp/_strnicmp). */
-static char statement_to_lower_ascii(char byte)
-{
-    return (byte >= 'A' && byte <= 'Z') ? (char)(byte - 'A' + 'a') : byte;
-}
-
-/* Portable ASCII case-insensitive prefix compare. Returns true when the first
- * prefix_length bytes of value match prefix ignoring case. Mirrors the
- * ascii_case_prefix helpers in results.c / query_parser.c / catalog.c. */
-static bool statement_ascii_case_prefix(const char *value, const char *prefix,
-                                        size_t prefix_length)
-{
-    for (size_t index = 0; index < prefix_length; index++) {
-        if (value[index] == '\0' ||
-            statement_to_lower_ascii(value[index]) !=
-                statement_to_lower_ascii(prefix[index])) {
-            return false;
-        }
-    }
-    return true;
-}
 
 /* Execute every fragment of a multi-statement query and chain the results.
  * Defined below; forward-declared because statement_execute (earlier in the
@@ -1532,7 +1509,7 @@ static bool is_savepoint_control_command(const char *sql_text)
      * (end of string or ASCII whitespace), so "RELEASE" does not match
      * "RELEASED". */
     #define MATCH_LEADING_KEYWORD(keyword)                                      \
-        (statement_ascii_case_prefix(cursor, (keyword), strlen(keyword)) &&    \
+        (pg_ascii_case_prefix(cursor, (keyword), strlen(keyword)) &&    \
          (cursor[strlen(keyword)] == '\0' ||                                    \
           isspace((unsigned char)cursor[strlen(keyword)])))
 
@@ -1545,7 +1522,7 @@ static bool is_savepoint_control_command(const char *sql_text)
             after++;
         }
         /* Only "ROLLBACK TO ..." is a savepoint command; plain ROLLBACK is not. */
-        if (statement_ascii_case_prefix(after, "TO", 2) &&
+        if (pg_ascii_case_prefix(after, "TO", 2) &&
             (after[2] == '\0' || isspace((unsigned char)after[2]))) {
             return true;
         }
@@ -2669,7 +2646,7 @@ static const char *skip_leading_spaces(const char *text)
 static bool starts_with_keyword(const char *text, const char *keyword)
 {
     size_t keyword_length = strlen(keyword);
-    if (!statement_ascii_case_prefix(text, keyword, keyword_length)) {
+    if (!pg_ascii_case_prefix(text, keyword, keyword_length)) {
         return false;
     }
     char following = text[keyword_length];

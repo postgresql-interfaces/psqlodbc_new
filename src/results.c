@@ -18,27 +18,13 @@
 #include "connection.h"
 #include "parameter.h"
 #include "error_mapping.h"
+#include "platform/string_utils.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <libpq-fe.h>
-
-/*
- * Portable string duplicate. strdup was only standardized in C23, so under
- * strict C11 we allocate and copy ourselves (mirrors diagnostics.c). Returns
- * NULL on allocation failure; the caller treats that as SQL_ERROR.
- */
-static char *duplicate_string(const char *source)
-{
-    size_t length = strlen(source) + 1;
-    char *copy = malloc(length);
-    if (copy) {
-        memcpy(copy, source, length);
-    }
-    return copy;
-}
 
 /* UTF-16 high (leading) surrogate range. A high surrogate is only meaningful
  * when immediately followed by a low surrogate, so a high surrogate landing at
@@ -150,40 +136,6 @@ static SQLRETURN write_null_date_empty_string(SQLSMALLINT target_type,
         }
     }
     return SQL_SUCCESS;
-}
-
-/* Lowercase a single ASCII byte. Interval unit keywords from PostgreSQL are
- * pure ASCII, so locale-independent byte lowercasing is correct here. */
-static char to_lower_ascii(char c)
-{
-    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-}
-
-/* Portable ASCII case-insensitive full-string compare (POSIX strcasecmp is not
- * C11 and MSVC spells it _stricmp). Returns true when the strings match. */
-static bool ascii_case_equal(const char *left, const char *right)
-{
-    while (*left && *right) {
-        if (to_lower_ascii(*left) != to_lower_ascii(*right)) {
-            return false;
-        }
-        left++;
-        right++;
-    }
-    return *left == *right;
-}
-
-/* Portable ASCII case-insensitive prefix compare. Returns true when the first
- * prefix_length bytes of value match prefix ignoring case. */
-static bool ascii_case_prefix(const char *value, const char *prefix, size_t prefix_length)
-{
-    for (size_t index = 0; index < prefix_length; index++) {
-        if (value[index] == '\0' ||
-            to_lower_ascii(value[index]) != to_lower_ascii(prefix[index])) {
-            return false;
-        }
-    }
-    return true;
 }
 
 /* Convert one lowercase/uppercase hex digit to its 4-bit value, or -1 if the
@@ -627,8 +579,8 @@ static bool parse_interval_text(SQLSMALLINT c_type, int fraction_precision,
     if (sscanf(text, "%d %15s %d %15s", &years, unit1, &months, unit2) >= 4 &&
         ((unit1[0] >= 'a' && unit1[0] <= 'z') ||
          (unit1[0] >= 'A' && unit1[0] <= 'Z'))) {
-        if (ascii_case_prefix(unit1, "year", 4) &&
-            ascii_case_prefix(unit2, "mon", 3) &&
+        if (pg_ascii_case_prefix(unit1, "year", 4) &&
+            pg_ascii_case_prefix(unit2, "mon", 3) &&
             (subtype == SQL_IS_MONTH || subtype == SQL_IS_YEAR_TO_MONTH)) {
             negative = years < 0;
             out->interval_type = subtype;
@@ -651,21 +603,21 @@ static bool parse_interval_text(SQLSMALLINT c_type, int fraction_precision,
         negative = years < 0;
         SQLUINTEGER magnitude = negative ? (SQLUINTEGER)(-years) : (SQLUINTEGER)years;
         if (subtype == SQL_IS_YEAR &&
-            (ascii_case_equal(unit1, "year") || ascii_case_equal(unit1, "years"))) {
+            (pg_ascii_case_equal(unit1, "year") || pg_ascii_case_equal(unit1, "years"))) {
             out->interval_type = subtype;
             out->interval_sign = negative ? SQL_TRUE : SQL_FALSE;
             out->intval.year_month.year = magnitude;
             return true;
         }
         if (subtype == SQL_IS_MONTH &&
-            (ascii_case_equal(unit1, "mon") || ascii_case_equal(unit1, "mons"))) {
+            (pg_ascii_case_equal(unit1, "mon") || pg_ascii_case_equal(unit1, "mons"))) {
             out->interval_type = subtype;
             out->interval_sign = negative ? SQL_TRUE : SQL_FALSE;
             out->intval.year_month.month = magnitude;
             return true;
         }
         if (subtype == SQL_IS_DAY &&
-            (ascii_case_equal(unit1, "day") || ascii_case_equal(unit1, "days"))) {
+            (pg_ascii_case_equal(unit1, "day") || pg_ascii_case_equal(unit1, "days"))) {
             out->interval_type = subtype;
             out->interval_sign = negative ? SQL_TRUE : SQL_FALSE;
             out->intval.day_second.day = magnitude;
@@ -685,7 +637,7 @@ static bool parse_interval_text(SQLSMALLINT c_type, int fraction_precision,
     scanned = sscanf(text, "%d %15s %02d:%02d:%02d.%15s",
                      &days, unit1, &hours, &minutes, &seconds, fraction_text);
     if (scanned == 5 || scanned == 6) {
-        if (!ascii_case_prefix(unit1, "day", 3)) {
+        if (!pg_ascii_case_prefix(unit1, "day", 3)) {
             return false;
         }
         negative = days < 0;
@@ -844,10 +796,10 @@ static SQLRETURN convert_value_to_c_type(OdbcStatement *statement,
          * the original driver and the widest value the ODBC types can hold. */
         static const char DATE_POSITIVE_INFINITY_CLAMP[] = "9999-12-31";
         static const char DATE_NEGATIVE_INFINITY_CLAMP[] = "0001-01-01";
-        if (ascii_case_equal(effective_value, "infinity")) {
+        if (pg_ascii_case_equal(effective_value, "infinity")) {
             effective_value = DATE_POSITIVE_INFINITY_CLAMP;
             effective_length = (int)(sizeof(DATE_POSITIVE_INFINITY_CLAMP) - 1);
-        } else if (ascii_case_equal(effective_value, "-infinity")) {
+        } else if (pg_ascii_case_equal(effective_value, "-infinity")) {
             effective_value = DATE_NEGATIVE_INFINITY_CLAMP;
             effective_length = (int)(sizeof(DATE_NEGATIVE_INFINITY_CLAMP) - 1);
         }
@@ -2795,7 +2747,7 @@ static SQLRETURN keyset_store_row_overlay(OdbcStatement *statement,
             continue;
         }
         row->override_values[column] =
-            duplicate_string(PQgetvalue(source, source_row, column));
+            pg_strdup(PQgetvalue(source, source_row, column));
     }
     return SQL_SUCCESS;
 }

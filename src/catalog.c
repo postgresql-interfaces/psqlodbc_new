@@ -14,26 +14,12 @@
 #include "catalog.h"
 #include "connection.h"
 #include "diagnostics.h"
+#include "platform/string_utils.h"
 
-#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Portable case-insensitive string comparison (strcasecmp is POSIX, not C11) */
-static int catalog_strcasecmp(const char *left, const char *right)
-{
-    while (*left && *right) {
-        int diff = tolower((unsigned char)*left) - tolower((unsigned char)*right);
-        if (diff != 0) {
-            return diff;
-        }
-        left++;
-        right++;
-    }
-    return tolower((unsigned char)*left) - tolower((unsigned char)*right);
-}
 #include <libpq-fe.h>
 
 /* Maximum size for catalog query strings. These queries have bounded size
@@ -293,7 +279,7 @@ SQLRETURN catalog_tables(OdbcStatement *statement,
                     token[--token_len] = '\0';
                 }
 
-                if (catalog_strcasecmp(token, "TABLE") == 0) {
+                if (pg_ascii_strcasecmp(token, "TABLE") == 0) {
                     /* The original driver classifies anything that is not a view
                      * and not a system table as a "regular table", so the TABLE
                      * type also matches partitioned tables ('p'), foreign tables
@@ -301,11 +287,11 @@ SQLRETURN catalog_tables(OdbcStatement *statement,
                      * excluded. Each still reports its own TABLE_TYPE label via
                      * the CASE expression in the SELECT. */
                     want_r = want_p = want_f = want_m = true;
-                } else if (catalog_strcasecmp(token, "VIEW") == 0) {
+                } else if (pg_ascii_strcasecmp(token, "VIEW") == 0) {
                     want_v = true;
-                } else if (catalog_strcasecmp(token, "MATERIALIZED VIEW") == 0) {
+                } else if (pg_ascii_strcasecmp(token, "MATERIALIZED VIEW") == 0) {
                     want_m = true;
-                } else if (catalog_strcasecmp(token, "FOREIGN TABLE") == 0) {
+                } else if (pg_ascii_strcasecmp(token, "FOREIGN TABLE") == 0) {
                     want_f = true;
                 }
             }

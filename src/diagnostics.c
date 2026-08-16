@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "diagnostics.h"
+#include "platform/string_utils.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -61,18 +62,9 @@ bool diagnostics_add_record(DiagnosticRecords *records,
 
     record->native_error_code = native_error_code;
 
-    /* Heap-allocate a copy of the message text.
-     * Using malloc+memcpy instead of strdup for strict C11 portability
-     * (strdup was only standardized in C23). */
-    if (message) {
-        size_t message_length = strlen(message);
-        record->message_text = malloc(message_length + 1);
-        if (record->message_text) {
-            memcpy(record->message_text, message, message_length + 1);
-        }
-    } else {
-        record->message_text = NULL;
-    }
+    /* Heap-allocate a copy of the message text. pg_strdup stands in for strdup,
+     * which was only standardized in C23. */
+    record->message_text = message ? pg_strdup(message) : NULL;
 
     records->record_count++;
     return true;

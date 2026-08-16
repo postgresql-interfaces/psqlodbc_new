@@ -13,27 +13,13 @@
  */
 #include "connection_string.h"
 #include "dsn_config.h"
+#include "platform/string_utils.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* ---- Internal Helpers ---- */
-
-/* Case-insensitive string comparison (portable; not all platforms have strcasecmp) */
-static int case_insensitive_compare(const char *left, const char *right)
-{
-    while (*left && *right) {
-        int diff = tolower((unsigned char)*left) - tolower((unsigned char)*right);
-        if (diff != 0) {
-            return diff;
-        }
-        left++;
-        right++;
-    }
-    return tolower((unsigned char)*left) - tolower((unsigned char)*right);
-}
 
 /* Safely copy a string into a fixed-size buffer, always null-terminating */
 static void safe_copy_to_buffer(char *destination, size_t destination_size, const char *source, size_t source_length)
@@ -49,24 +35,24 @@ static void safe_copy_to_buffer(char *destination, size_t destination_size, cons
 /* Store a parsed key-value pair into the appropriate ConnectionInfo field */
 static void store_connection_parameter(ConnectionInfo *info, const char *key, const char *value, size_t value_length)
 {
-    if (case_insensitive_compare(key, "Server") == 0 ||
-        case_insensitive_compare(key, "Servername") == 0) {
+    if (pg_ascii_strcasecmp(key, "Server") == 0 ||
+        pg_ascii_strcasecmp(key, "Servername") == 0) {
         safe_copy_to_buffer(info->server, sizeof(info->server), value, value_length);
 
-    } else if (case_insensitive_compare(key, "Port") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Port") == 0) {
         safe_copy_to_buffer(info->port, sizeof(info->port), value, value_length);
 
-    } else if (case_insensitive_compare(key, "Database") == 0 ||
-               case_insensitive_compare(key, "DB") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Database") == 0 ||
+               pg_ascii_strcasecmp(key, "DB") == 0) {
         safe_copy_to_buffer(info->database, sizeof(info->database), value, value_length);
 
-    } else if (case_insensitive_compare(key, "UID") == 0 ||
-               case_insensitive_compare(key, "Username") == 0 ||
-               case_insensitive_compare(key, "User") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "UID") == 0 ||
+               pg_ascii_strcasecmp(key, "Username") == 0 ||
+               pg_ascii_strcasecmp(key, "User") == 0) {
         safe_copy_to_buffer(info->username, sizeof(info->username), value, value_length);
 
-    } else if (case_insensitive_compare(key, "PWD") == 0 ||
-               case_insensitive_compare(key, "Password") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "PWD") == 0 ||
+               pg_ascii_strcasecmp(key, "Password") == 0) {
         /* Password is heap-allocated so it can be securely wiped later */
         free(info->password);
         info->password = malloc(value_length + 1);
@@ -75,64 +61,64 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
             info->password[value_length] = '\0';
         }
 
-    } else if (case_insensitive_compare(key, "SSLmode") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "SSLmode") == 0) {
         safe_copy_to_buffer(info->sslmode, sizeof(info->sslmode), value, value_length);
 
-    } else if (case_insensitive_compare(key, "ApplicationName") == 0 ||
-               case_insensitive_compare(key, "Application_Name") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "ApplicationName") == 0 ||
+               pg_ascii_strcasecmp(key, "Application_Name") == 0) {
         safe_copy_to_buffer(info->application_name, sizeof(info->application_name), value, value_length);
 
-    } else if (case_insensitive_compare(key, "Timeout") == 0 ||
-               case_insensitive_compare(key, "Connect_Timeout") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Timeout") == 0 ||
+               pg_ascii_strcasecmp(key, "Connect_Timeout") == 0) {
         /* Parse timeout as an unsigned integer */
         char timeout_buffer[16];
         safe_copy_to_buffer(timeout_buffer, sizeof(timeout_buffer), value, value_length);
         info->connect_timeout = (unsigned int)strtoul(timeout_buffer, NULL, 10);
 
-    } else if (case_insensitive_compare(key, "BoolsAsChar") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "BoolsAsChar") == 0) {
         /* Any non-zero integer enables describing bool columns as VARCHAR(5).
          * A value of "0" turns it off, exposing bool as SQL_BIT instead. */
         char bool_buffer[16];
         safe_copy_to_buffer(bool_buffer, sizeof(bool_buffer), value, value_length);
         info->bools_as_char = (strtol(bool_buffer, NULL, 10) != 0);
 
-    } else if (case_insensitive_compare(key, "UnknownSizes") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "UnknownSizes") == 0) {
         char size_buffer[16];
         safe_copy_to_buffer(size_buffer, sizeof(size_buffer), value, value_length);
         info->unknown_sizes = (int)strtol(size_buffer, NULL, 10);
 
-    } else if (case_insensitive_compare(key, "MaxVarcharSize") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "MaxVarcharSize") == 0) {
         char size_buffer[16];
         safe_copy_to_buffer(size_buffer, sizeof(size_buffer), value, value_length);
         info->max_varchar_size = (int)strtol(size_buffer, NULL, 10);
 
-    } else if (case_insensitive_compare(key, "Parse") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Parse") == 0) {
         /* Enable client-side SELECT parsing for refined column metadata. */
         char parse_buffer[16];
         safe_copy_to_buffer(parse_buffer, sizeof(parse_buffer), value, value_length);
         info->parse_statements = (strtol(parse_buffer, NULL, 10) != 0);
 
-    } else if (case_insensitive_compare(key, "FetchRefcursors") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "FetchRefcursors") == 0) {
         /* When enabled, refcursor OUT parameters returned by a called function
          * are automatically FETCH ALL'd and exposed as successive result sets. */
         char refcursor_buffer[16];
         safe_copy_to_buffer(refcursor_buffer, sizeof(refcursor_buffer), value, value_length);
         info->fetch_refcursors = (strtol(refcursor_buffer, NULL, 10) != 0);
 
-    } else if (case_insensitive_compare(key, "Fetch") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Fetch") == 0) {
         /* Cursor fetch cache size in the original driver. This modern driver
          * materializes whole result sets, so the cache size has no effect; the
          * keyword is accepted (and ignored) for connection-string compatibility
          * with applications and tests that set it. */
 
-    } else if (case_insensitive_compare(key, "UseDeclareFetch") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "UseDeclareFetch") == 0) {
         /* The original driver uses a server-side DECLARE/FETCH cursor to stream
          * large result sets in chunks. This modern driver always materializes
          * the whole result set client-side (which inherently survives a mid-fetch
          * COMMIT), so the option needs no distinct code path; it is accepted for
          * connection-string compatibility with applications and tests that set it. */
 
-    } else if (case_insensitive_compare(key, "Protocol") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Protocol") == 0) {
         /* The historical "Protocol" keyword has the form "7.4-N", where the
          * trailing N selects the error-rollback behavior (rollback_on_error).
          * The "7.4" prefix is a legacy wire-protocol label with no effect on a
@@ -144,14 +130,14 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
             info->rollback_on_error = (int)strtol(dash + 1, NULL, 10);
         }
 
-    } else if (case_insensitive_compare(key, "LFConversion") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "LFConversion") == 0) {
         /* Explicit keyword form: any non-zero integer enables LF -> CR+LF
          * expansion on string output (see ConnectionInfo.lf_conversion). */
         char lf_buffer[16];
         safe_copy_to_buffer(lf_buffer, sizeof(lf_buffer), value, value_length);
         info->lf_conversion = (strtol(lf_buffer, NULL, 10) != 0);
 
-    } else if (case_insensitive_compare(key, "CX") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "CX") == 0) {
         /* The abbreviated "CX" attribute packs several common driver options
          * into one hex bitfield. The original driver optionally prefixes the
          * value with a two-hex-digit count when the string is >= 2 characters;
@@ -166,7 +152,7 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
         long cx_flags = strtol(flag_text, NULL, 16);
         info->lf_conversion = ((cx_flags & CONNECTION_LF_CONVERSION_BIT) != 0);
 
-    } else if (case_insensitive_compare(key, "AB") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "AB") == 0) {
         /* The "AB" (extra options) attribute is a hex bitfield of assorted
          * driver quirks. We consume the CvtNullDate bit (empty string -> NULL
          * for date/time parameters); other bits are not implemented. */
@@ -175,12 +161,12 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
         long ab_flags = strtol(ab_buffer, NULL, 16);
         info->cvt_null_date = ((ab_flags & CONNECTION_CVT_NULL_DATE_BIT) != 0);
 
-    } else if (case_insensitive_compare(key, "DisallowPremature") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "DisallowPremature") == 0) {
         /* Accepted for compatibility with the original driver; the modern
          * implementation always describes results after execution, so there is
          * no "premature" describe to disallow. No stored effect. */
 
-    } else if (case_insensitive_compare(key, "DSN") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "DSN") == 0) {
         /* Resolve the DSN from odbc.ini to populate connection defaults.
          * Subsequent keys in the connection string will override these values
          * because parsing continues after this point. If DSN lookup fails
@@ -190,7 +176,7 @@ static void store_connection_parameter(ConnectionInfo *info, const char *key, co
             safe_copy_to_buffer(info->database, sizeof(info->database), value, value_length);
         }
 
-    } else if (case_insensitive_compare(key, "Driver") == 0) {
+    } else if (pg_ascii_strcasecmp(key, "Driver") == 0) {
         /* The Driver key is consumed by the Driver Manager to select the
          * driver shared library. By the time the driver sees it, it's irrelevant. */
     }

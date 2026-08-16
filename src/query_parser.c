@@ -23,6 +23,7 @@
  * being mistaken for a parameter marker or an escape.
  */
 #include "query_parser.h"
+#include "platform/string_utils.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -53,15 +54,6 @@ static bool is_identifier_continuation_char(char character)
 {
     return is_identifier_start_char(character) ||
            (character >= '0' && character <= '9');
-}
-
-/* Lowercase a single ASCII letter; leaves other bytes unchanged. */
-static char to_lower_ascii(char character)
-{
-    if (character >= 'A' && character <= 'Z') {
-        return (char)(character + ('a' - 'A'));
-    }
-    return character;
 }
 
 /*
@@ -128,7 +120,7 @@ static bool match_keyword_at(const char *input, size_t position, size_t input_le
         return false;
     }
     for (size_t i = 0; i < keyword_length; i++) {
-        if (to_lower_ascii(input[position + i]) != to_lower_ascii(keyword[i])) {
+        if (pg_ascii_tolower(input[position + i]) != pg_ascii_tolower(keyword[i])) {
             return false;
         }
     }
@@ -188,24 +180,6 @@ static const OdbcFunctionMapping ODBC_FUNCTION_MAPPINGS[] = {
 };
 
 /*
- * Portable ASCII case-insensitive string comparison. Returns true when both
- * strings match ignoring letter case. Used instead of POSIX strcasecmp, which
- * is unavailable on MSVC (it spells it _stricmp); ODBC function names are pure
- * ASCII so byte-wise lowercasing is sufficient and locale-independent.
- */
-static bool ascii_case_equal(const char *left, const char *right)
-{
-    while (*left && *right) {
-        if (to_lower_ascii(*left) != to_lower_ascii(*right)) {
-            return false;
-        }
-        left++;
-        right++;
-    }
-    return *left == *right;
-}
-
-/*
  * Find the PostgreSQL template for an ODBC function name given the number of
  * arguments in the call. Returns NULL when the function is not remapped (the
  * caller should then emit the function name verbatim).
@@ -217,10 +191,10 @@ static const char *find_function_template(const char *function_name, int argumen
         if (candidate[0] == '%') {
             /* "%K<name>": match only when argument_count == K */
             if ((candidate[1] - '0') == argument_count &&
-                ascii_case_equal(candidate + 2, function_name)) {
+                pg_ascii_case_equal(candidate + 2, function_name)) {
                 return ODBC_FUNCTION_MAPPINGS[i].pg_template;
             }
-        } else if (ascii_case_equal(candidate, function_name)) {
+        } else if (pg_ascii_case_equal(candidate, function_name)) {
             return ODBC_FUNCTION_MAPPINGS[i].pg_template;
         }
     }
