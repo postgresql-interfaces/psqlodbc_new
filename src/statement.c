@@ -403,6 +403,35 @@ static SQLRETURN handle_execution_result(OdbcStatement *statement, PGresult *res
         return SQL_ERROR;
     }
 
+    case PGRES_COPY_IN:
+    case PGRES_COPY_OUT:
+    case PGRES_COPY_BOTH: {
+        /* COPY ... FROM STDIN / TO STDOUT hands the connection over to libpq's
+         * COPY streaming sub-protocol, which this driver does not implement.
+         * If left in copy mode, the server would wait forever for CopyData we
+         * never send, and the next command the driver issues (e.g. the
+         * per-statement SAVEPOINT teardown) would terminate the copy abnormally
+         * and abort the whole transaction. Unwind the copy so the connection is
+         * usable again, then report it as an unimplemented optional feature.
+         *
+         * Detection keys off the libpq result STATUS, not the SQL text, so a
+         * file-based COPY (COPY ... TO '/path', which returns PGRES_COMMAND_OK)
+         * or a column literally named "stdin" is never mistaken for a
+         * client-stream COPY. */
+        connection_abort_active_copy(statement->parent_connection, status);
+        PQclear(result);
+
+        /* Match the original driver's wording exactly — the regression suite
+         * compares against "<context>;\n<detail>". */
+        diagnostics_clear(&statement->diagnostics);
+        diagnostics_add_record(&statement->diagnostics,
+                               "HYC00",  /* Optional feature not implemented */
+                               0,
+                               "Error while executing the query;\n"
+                               "COPY ... FROM STDIN / TO STDOUT is not supported in ODBC");
+        return SQL_ERROR;
+    }
+
     default: {
         /* Unexpected result status — extract whatever error info is available */
         diagnostics_clear(&statement->diagnostics);

@@ -758,3 +758,51 @@ void connection_handle_statement_error(OdbcConnection *connection)
      * leave the transaction FAILED for the application to resolve with its own
      * SQLEndTran(ROLLBACK). */
 }
+
+void connection_abort_active_copy(OdbcConnection *connection, ExecStatusType copy_status)
+{
+    if (!connection || !connection->libpq_connection) {
+        return;
+    }
+    PGconn *libpq_connection = connection->libpq_connection;
+
+    /* A COPY ... FROM STDIN leaves libpq waiting to stream CopyData we will
+     * never produce. End it with a non-NULL error string so the server fails
+     * the COPY immediately instead of blocking in ClientRead forever. */
+    if (copy_status == PGRES_COPY_IN || copy_status == PGRES_COPY_BOTH) {
+        PQputCopyEnd(libpq_connection,
+                     "COPY ... FROM STDIN / TO STDOUT is not supported in ODBC");
+    }
+
+    /* A COPY ... TO STDOUT streams rows to the client. There is no "abort"
+     * primitive for copy-out, so drain and discard the data until the stream
+     * ends, which returns the connection to a normal command state. */
+    if (copy_status == PGRES_COPY_OUT || copy_status == PGRES_COPY_BOTH) {
+        char *copy_row = NULL;
+        int copy_bytes;
+        /* >0 = a row (must be freed), -1 = copy done, -2 = error. */
+        while ((copy_bytes = PQgetCopyData(libpq_connection, &copy_row, 0)) > 0) {
+            if (copy_row) {
+                PQfreemem(copy_row);
+                copy_row = NULL;
+            }
+        }
+        if (copy_row) {
+            PQfreemem(copy_row);
+        }
+    }
+
+    /* Consume the trailing result(s) so the connection leaves copy mode and is
+     * usable again. Aborting a copy-in makes the server report the COPY as
+     * failed, which poisons the surrounding transaction — mark it FAILED so the
+     * caller's statement-error handler rewinds to the per-statement savepoint
+     * and keeps the transaction (and its earlier work) usable. */
+    PGresult *trailing_result;
+    while ((trailing_result = PQgetResult(libpq_connection)) != NULL) {
+        if (PQresultStatus(trailing_result) == PGRES_FATAL_ERROR &&
+            connection->transaction_state == TRANSACTION_STATE_ACTIVE) {
+            connection->transaction_state = TRANSACTION_STATE_FAILED;
+        }
+        PQclear(trailing_result);
+    }
+}

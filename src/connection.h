@@ -415,4 +415,17 @@ void connection_begin_statement_savepoint(OdbcConnection *connection);
  */
 void connection_handle_statement_error(OdbcConnection *connection);
 
+/*
+ * Unwind an in-progress COPY that libpq handed back as PGRES_COPY_IN,
+ * PGRES_COPY_OUT, or PGRES_COPY_BOTH. This driver does not implement the COPY
+ * streaming sub-protocol, so a COPY ... FROM STDIN / TO STDOUT must not be left
+ * mid-stream: doing so would block the backend (copy-in) and cause the next
+ * command the driver issues to terminate the copy abnormally, poisoning the
+ * whole transaction. Ends copy-in with an error, drains copy-out, and consumes
+ * the trailing result(s) so the connection returns to a usable state. When the
+ * unwound copy left the transaction aborted, the connection is marked FAILED so
+ * connection_handle_statement_error can rewind to the per-statement savepoint.
+ */
+void connection_abort_active_copy(OdbcConnection *connection, ExecStatusType copy_status);
+
 #endif /* PSQLODBC2_CONNECTION_H */
