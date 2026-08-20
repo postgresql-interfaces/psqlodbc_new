@@ -74,28 +74,38 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- The driver component. The <ODBCDriver> child both places the DLL and
-         writes ODBCINST.INI. KeyPath is the DLL file so repair/upgrade track it. -->
+    <!-- The driver component. The <ODBCDriver> child both places the driver DLL
+         and writes ODBCINST.INI. KeyPath is the DLL file so repair/upgrade track
+         it. File= is the driver DLL; SetupFile= points at the setup DLL, which
+         lives in its own component below — together they generate the
+         ODBCINST.INI Driver= and Setup= rows for us. -->
     <Component Id="DriverComponent" Directory="BINDIR" Guid="*">
       <File Id="DriverDllFile"
             Name="$(DriverDll)"
             Source="$(BinSource)\$(DriverDll)"
             KeyPath="yes" />
-      <!-- The setup DLL lives in the same component as the driver so its
-           registration is tied to the driver's lifecycle. File= is the driver
-           DLL; SetupFile= is this setup DLL — together they generate the
-           ODBCINST.INI Driver= and Setup= rows for us. -->
-      <File Id="SetupDllFile"
-            Name="$(SetupDll)"
-            Source="$(BinSource)\$(SetupDll)" />
       <ODBCDriver Id="PsqlOdbc2Driver"
                   Name="$(DriverName)"
                   File="DriverDllFile"
                   SetupFile="SetupDllFile" />
     </Component>
 
+    <!-- The setup DLL gets its own single-file component. It must be separate
+         from DriverComponent: a component with more than one file cannot use an
+         auto-generated Guid ("*") unless its keypath is a versioned file, and
+         our driver DLL carries no version resource (WIX0367). Keeping each DLL
+         in its own single-file component lets both keep auto-generated GUIDs.
+         Same feature as the driver, so they install and uninstall together. -->
+    <Component Id="SetupComponent" Directory="BINDIR" Guid="*">
+      <File Id="SetupDllFile"
+            Name="$(SetupDll)"
+            Source="$(BinSource)\$(SetupDll)"
+            KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main" Title="psqlODBC2 Driver" Level="1">
       <ComponentRef Id="DriverComponent" />
+      <ComponentRef Id="SetupComponent" />
 
       <!-- libpq and its transitive runtime DLLs (OpenSSL, zlib, gettext, ...)
            are copied next to the driver at build time (see release.yml). The
