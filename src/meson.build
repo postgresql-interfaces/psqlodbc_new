@@ -35,3 +35,43 @@ psqlodbc2_lib = shared_library('psqlodbc2w',
     gnu_symbol_visibility : 'hidden',
     install : true,
 )
+
+# ---- Windows-only DSN setup DLL ----
+#
+# The ODBC Data Source Administrator loads this separate DLL to add/configure/
+# remove a DSN (it exports ConfigDSN/ConfigDSNW/ConfigDriver). It is kept out of
+# the driver DLL so the GUI/installer dependencies below are not pulled into the
+# always-loaded driver. This entire block is guarded to Windows and therefore
+# never evaluates on Linux/macOS — the setup source is inherently platform code.
+if host_machine.system() == 'windows'
+    windows_compiler = meson.get_compiler('c')
+
+    # ODBC installer + Win32 GUI libraries required by the setup routines.
+    # odbccp32 provides SQLWriteDSNToIni / SQLWritePrivateProfileString /
+    # SQLRemoveDSNFromIni / SQLGetPrivateProfileString; user32/comctl32 back
+    # the dialog (DialogBoxParamW and its controls).
+    setup_windows_deps = [
+        windows_compiler.find_library('odbccp32'),
+        windows_compiler.find_library('odbc32'),
+        windows_compiler.find_library('comctl32'),
+        windows_compiler.find_library('user32'),
+        windows_compiler.find_library('comdlg32'),
+    ]
+
+    # Compile the dialog resource script (.rc) into a linkable object. The
+    # include_directories lets the .rc find setup/resource.h. This uses
+    # Meson's windows module, which drives rc.exe (MSVC) or windres (MinGW).
+    windows_module = import('windows')
+    setup_dialog_resources = windows_module.compile_resources(
+        'setup/setup_dialog.rc',
+        include_directories : include_directories('setup'),
+    )
+
+    psqlodbc2_setup_lib = shared_library('psqlodbc2setup',
+        ['setup/setup_windows.c', setup_dialog_resources],
+        include_directories : [inc, include_directories('.', 'setup')],
+        dependencies : setup_windows_deps,
+        vs_module_defs : 'setup/psqlodbc2setup.def',
+        install : true,
+    )
+endif

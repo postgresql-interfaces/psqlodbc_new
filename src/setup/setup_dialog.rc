@@ -1,0 +1,70 @@
+/*-------------------------------------------------------------------------
+ *
+ * setup_dialog.rc
+ *	  Win32 resource script for the psqlodbc2 DSN configuration dialog.
+ *
+ * Defines one modal dialog (IDD_CONFIG_DIALOG) with a labeled edit control
+ * for every DSN keyword the driver honors, plus OK/Cancel. The dialog
+ * procedure lives in setup_windows.c and refers to every control by the named
+ * constants in resource.h — there are no bare control numbers here.
+ *
+ * This file is compiled only on Windows (via Meson's `windows` module) and is
+ * never handed to the compiler on Linux/macOS.
+ *
+ * Copyright (c) 2026, Dave Cramer
+ *
+ *
+ * IDENTIFICATION
+ *	  src/setup/setup_dialog.rc
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#include <windows.h>
+#include "resource.h"
+
+/*
+ * Coordinates below are in dialog units (DLUs), not pixels, so the layout
+ * scales with the system font. One text row is 8 DLU tall; edit controls are
+ * 12 DLU tall with a 6 DLU gap, giving an 18 DLU row pitch. Labels are
+ * right-aligned in a fixed-width column so the edit fields line up.
+ */
+
+IDD_CONFIG_DIALOG DIALOGEX 0, 0, 260, 210
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "PostgreSQL ODBC Driver (psqlodbc2) DSN Setup"
+FONT 8, "MS Shell Dlg", 0, 0, 0x1
+BEGIN
+    RTEXT           "Data Source (&N):", -1, 7, 9, 70, 8
+    EDITTEXT        IDC_EDIT_DATA_SOURCE_NAME, 82, 7, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Description:", -1, 7, 27, 70, 8
+    EDITTEXT        IDC_EDIT_DESCRIPTION, 82, 25, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Server:", -1, 7, 45, 70, 8
+    EDITTEXT        IDC_EDIT_SERVERNAME, 82, 43, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Port:", -1, 7, 63, 70, 8
+    EDITTEXT        IDC_EDIT_PORT, 82, 61, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "Data&base:", -1, 7, 81, 70, 8
+    EDITTEXT        IDC_EDIT_DATABASE, 82, 79, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Username:", -1, 7, 99, 70, 8
+    EDITTEXT        IDC_EDIT_USERNAME, 82, 97, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "Pass&word:", -1, 7, 117, 70, 8
+    EDITTEXT        IDC_EDIT_PASSWORD, 82, 115, 170, 12, ES_PASSWORD | ES_AUTOHSCROLL
+
+    RTEXT           "SSL &Mode:", -1, 7, 135, 70, 8
+    EDITTEXT        IDC_EDIT_SSLMODE, 82, 133, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Application:", -1, 7, 153, 70, 8
+    EDITTEXT        IDC_EDIT_APPLICATION_NAME, 82, 151, 170, 12, ES_AUTOHSCROLL
+
+    RTEXT           "&Timeout (s):", -1, 7, 171, 70, 8
+    EDITTEXT        IDC_EDIT_TIMEOUT, 82, 169, 170, 12, ES_AUTOHSCROLL
+
+    DEFPUSHBUTTON   "OK", IDOK, 148, 189, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 202, 189, 50, 14
+END

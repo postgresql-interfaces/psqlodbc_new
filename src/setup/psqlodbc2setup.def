@@ -1,0 +1,5 @@
+LIBRARY psqlodbc2setup
+EXPORTS
+    ConfigDSN     @1
+    ConfigDSNW    @2
+    ConfigDriver  @3

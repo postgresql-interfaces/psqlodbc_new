@@ -38,6 +38,11 @@
        Administrator and must match the Driver= keyword in connection strings. -->
   <?define DriverName = "PostgreSQL ODBC Driver (psqlodbc2)" ?>
   <?define DriverDll = "psqlodbc2w.dll" ?>
+  <!-- Setup DLL: exports ConfigDSN/ConfigDSNW/ConfigDriver so the ODBC Data
+       Source Administrator can show the driver's DSN dialog. Registered via the
+       <ODBCDriver SetupFile=...> attribute, which writes the driver's Setup=
+       value into ODBCINST.INI. -->
+  <?define SetupDll = "psqlodbc2setup.dll" ?>
 
   <Package
     Name="psqlODBC2 ($(ArchName))"
@@ -76,9 +81,17 @@
             Name="$(DriverDll)"
             Source="$(BinSource)\$(DriverDll)"
             KeyPath="yes" />
+      <!-- The setup DLL lives in the same component as the driver so its
+           registration is tied to the driver's lifecycle. File= is the driver
+           DLL; SetupFile= is this setup DLL — together they generate the
+           ODBCINST.INI Driver= and Setup= rows for us. -->
+      <File Id="SetupDllFile"
+            Name="$(SetupDll)"
+            Source="$(BinSource)\$(SetupDll)" />
       <ODBCDriver Id="PsqlOdbc2Driver"
                   Name="$(DriverName)"
-                  File="DriverDllFile" />
+                  File="DriverDllFile"
+                  SetupFile="SetupDllFile" />
     </Component>
 
     <Feature Id="Main" Title="psqlODBC2 Driver" Level="1">
@@ -92,6 +105,9 @@
            (it carries the <ODBCDriver> registration and must keep a stable id). -->
       <Files Include="$(BinSource)\*.dll" Directory="BINDIR">
         <Exclude Files="$(BinSource)\$(DriverDll)" />
+        <!-- Also its own component above (carries the <ODBCDriver> SetupFile
+             registration), so keep it out of the auto-harvested set. -->
+        <Exclude Files="$(BinSource)\$(SetupDll)" />
       </Files>
     </Feature>
 

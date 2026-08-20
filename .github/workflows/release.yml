@@ -176,6 +176,9 @@ jobs:
       run: |
         New-Item -ItemType Directory -Force -Path stage | Out-Null
         Copy-Item builddir/src/psqlodbc2w.dll stage/
+        # The DSN setup DLL (ConfigDSN et al.) is registered by the MSI via the
+        # <ODBCDriver SetupFile=...> element, so it must be present in the stage.
+        Copy-Item builddir/src/psqlodbc2setup.dll stage/
         $vcpkgBin = "$env:VCPKG_INSTALLATION_ROOT/installed/${{ matrix.vcpkg_triplet }}/bin"
         Copy-Item "$vcpkgBin/*.dll" stage/
 

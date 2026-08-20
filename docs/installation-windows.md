@@ -32,19 +32,28 @@ Open **ODBC Data Source Administrator** (search for "ODBC" in the Start menu; us
 That exact string is also what you use as the `Driver=` value in DSN-less connection
 strings.
 
-## Step 3 — Configuring connections
+## Step 3 — Create a DSN
 
-> **No setup dialog.** Unlike the original psqlodbc, this driver does not (yet) provide
-> a configuration GUI. It exports no `ConfigDSN` routine and registers no setup DLL, so
-> selecting it in the ODBC Data Source Administrator and clicking **Add…** or
-> **Configure** will *not* open a driver-specific dialog to fill in server/port/database
-> (Windows may report that the driver's setup routines could not be found). Configure
-> connections one of the two ways below instead. A native setup dialog is tracked as
-> future work in [specs/windows-setup-dialog.md](../specs/windows-setup-dialog.md).
+The driver ships a setup dialog, so you can create a DSN directly in the ODBC Data
+Source Administrator:
 
-### Option A — DSN-less connection string (recommended)
+1. Choose the **User DSN** or **System DSN** tab.
+2. Click **Add…**, select **PostgreSQL ODBC Driver (psqlodbc2)**, and click **Finish**.
+3. In the **PostgreSQL ODBC Driver (psqlodbc2) DSN Setup** dialog, enter a data source
+   name plus the server, port, database, user, and other fields, then click **OK**.
+4. To change a DSN later, select it and click **Configure**; to delete it, click
+   **Remove**.
 
-No registry setup is needed. Applications pass all options in the connection string:
+The dialog exposes the DSN keys the driver honors (server, port, database, username,
+password, SSL mode, application name, timeout); the full list is in
+[connection-options.md](connection-options.md#dsn-keys-odbcini--registry). On Windows,
+DSN definitions are stored in the registry — the Administrator manages that for you.
+Applications then connect with `DSN=MyPostgres`.
+
+### Alternatives to a DSN
+
+**DSN-less connection string** — no DSN or registry setup at all; the application passes
+every option inline:
 
 ```
 Driver={PostgreSQL ODBC Driver (psqlodbc2)};Server=localhost;Port=5432;Database=mydb;UID=postgres;PWD=secret
@@ -52,12 +61,9 @@ Driver={PostgreSQL ODBC Driver (psqlodbc2)};Server=localhost;Port=5432;Database=
 
 See [connection-options.md](connection-options.md) for every supported keyword.
 
-### Option B — Create a DSN via the registry
-
-On Windows, DSN definitions live in the registry (there is no `odbc.ini` file). Because
-there is no setup dialog, create the entries directly. Save the following as a `.reg`
-file and import it (adjust the values and, for a User DSN, use `HKEY_CURRENT_USER`
-instead of `HKEY_LOCAL_MACHINE`):
+**Registry import** — to script DSN creation without opening the dialog, save the
+following as a `.reg` file and import it (adjust the values and, for a User DSN, use
+`HKEY_CURRENT_USER` instead of `HKEY_LOCAL_MACHINE`):
 
 ```reg
 Windows Registry Editor Version 5.00
@@ -111,8 +117,10 @@ See [connection-options.md](connection-options.md) for every supported keyword.
   Administrator for a 64-bit driver (a 32-bit application uses the 32-bit
   `odbcad32.exe`, which has a separate driver list).
 - **"The setup routines for the … driver could not be found" when clicking Add… /
-  Configure** — expected: this driver has no configuration GUI (see Step 3). Configure
-  connections with a DSN-less connection string or a registry-created DSN instead.
+  Configure** — the setup DLL (`psqlodbc2setup.dll`) is missing or not registered.
+  It is installed and registered by the MSI; reinstall if it was removed or if the DLL
+  was moved out of its install folder. As a workaround, use a DSN-less connection string
+  or the registry import in Step 3.
 - **DLL load failure when connecting** — a runtime dependency is missing. The MSI
   bundles libpq's DLLs next to the driver; if you moved the driver DLL out of its
   install folder, the loader can no longer find them.
