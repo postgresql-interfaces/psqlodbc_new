@@ -37,6 +37,7 @@ Driver={PostgreSQL ODBC Driver (psqlodbc2)};Server=localhost;Port=5432;Database=
 | Build from source (all platforms) | [docs/building.md](docs/building.md) |
 | Meson build options | [docs/build-options.md](docs/build-options.md) |
 | Connection-string keywords, DSN keys, connect attributes | [docs/connection-options.md](docs/connection-options.md) |
+| Cutting a release (maintainers) | [docs/releasing.md](docs/releasing.md) |
 
 ## License
 
