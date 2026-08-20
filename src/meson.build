@@ -58,6 +58,15 @@ if host_machine.system() == 'windows'
         windows_compiler.find_library('comdlg32'),
     ]
 
+    # odbccp32.lib was built against an older CRT and pulls in StringCchPrintfW,
+    # which references the _vsnwprintf_s symbol. Modern UCRT defines that
+    # function inline in <stdio.h>, so the exported symbol only exists in
+    # legacy_stdio_definitions.lib. Without it the setup DLL fails to link with
+    # "unresolved external symbol _vsnwprintf_s". MSVC-only; MinGW is unaffected.
+    if windows_compiler.get_id() == 'msvc'
+        setup_windows_deps += windows_compiler.find_library('legacy_stdio_definitions')
+    endif
+
     # Compile the dialog resource script (.rc) into a linkable object. The
     # include_directories lets the .rc find setup/resource.h. This uses
     # Meson's windows module, which drives rc.exe (MSVC) or windres (MinGW).
